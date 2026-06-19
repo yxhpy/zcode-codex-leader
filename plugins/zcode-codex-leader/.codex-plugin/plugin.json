@@ -1,0 +1,32 @@
+{
+  "name": "zcode-codex-leader",
+  "version": "0.1.0",
+  "description": "Force ZCode/Codex into leader-only mode. Hard PreToolUse gate blocks direct edits and commands; all code generation, visual understanding, image generation, and MCP tool work is dispatched to a resident codex app-server worker via codex_bridge.ts. SessionStart injects the leader constitution and starts the worker; Stop enforces Plugin evidence.",
+  "author": {
+    "name": "zcode-codex-leader contributors"
+  },
+  "homepage": "https://github.com/yxhpy/zcode-codex-leader",
+  "repository": "https://github.com/yxhpy/zcode-codex-leader",
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "ZCode Codex Leader",
+    "shortDescription": "Leader-only ZCode + resident codex app-server worker bridge.",
+    "longDescription": "ZCode Codex Leader makes ZCode/Codex an owner agent that never does substantive implementation directly. A SessionStart hook injects the leader constitution and starts a resident codex app-server worker (sub-second handshake, no CLI cold-start). A PreToolUse hook hard-blocks Edit/Write/NotebookEdit and write-class Bash tools, allowing only reads and dispatch calls to codex_bridge.ts. codex_bridge.ts exposes four capabilities over the resident worker: ask (code generation/parsing with optional output schema), vision (local image understanding), generate-image (image generation via image_generation_call), and mcp-tool (direct MCP tool calls). Each dispatch records a Plugin evidence line; a Stop hook refuses completion when dispatched work lacks evidence.",
+    "developerName": "zcode-codex-leader contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Coordination",
+      "CodeGeneration",
+      "Vision",
+      "ImageGeneration",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "You are the owner. Dispatch implementation work via codex_bridge.ts.",
+      "Do not edit or write files directly; reads and planning are allowed.",
+      "Report a Plugin evidence: line for each dispatched capability on completion."
+    ]
+  }
+}

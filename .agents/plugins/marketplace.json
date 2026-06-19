@@ -1,0 +1,23 @@
+{
+  "name": "zcode-codex-leader",
+  "interface": {
+    "displayName": "ZCode Codex Leader",
+    "description": "Leader-only ZCode/Codex orchestration with a resident codex app-server worker bridge for code generation, visual understanding, image generation, and MCP tool dispatch."
+  },
+  "plugins": [
+    {
+      "name": "zcode-codex-leader",
+      "source": {
+        "source": "local",
+        "path": "./plugins/zcode-codex-leader"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity",
+      "summary": "Forces ZCode/Codex into leader-only mode via PreToolUse hard blocks and dispatches code/vision/image/MCP work to a resident codex app-server worker."
+    }
+  ],
+  "description": "Local marketplace metadata for ZCode Codex Leader."
+}

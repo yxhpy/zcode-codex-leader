@@ -1,0 +1,13 @@
+{
+  "name": "zcode-codex-leader",
+  "description": "Force ZCode/Codex into leader-only mode and dispatch code generation, visual understanding, image generation, and MCP tool calls to a resident codex app-server worker. Sub-second handshake, no CLI cold-start.",
+  "plugins": [
+    {
+      "name": "zcode-codex-leader",
+      "path": "plugins/zcode-codex-leader",
+      "install": "codex plugin add zcode-codex-leader@zcode-codex-leader",
+      "summary": "Leader-only ZCode with a resident codex app-server worker bridge for code, vision, image generation, and MCP tools. Hard PreToolUse gate blocks direct edits; Stop gate enforces Plugin evidence."
+    }
+  ],
+  "skills": []
+}

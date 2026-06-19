@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" session-start",
+            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" session-start",
+            "timeout": 30,
+            "statusMessage": "Starting codex app-server worker and injecting leader constitution"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" pre-tool-use",
+            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" pre-tool-use",
+            "timeout": 5,
+            "statusMessage": "Leader gate: checking tool use"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" user-prompt-submit",
+            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" user-prompt-submit",
+            "timeout": 5,
+            "statusMessage": "Leader gate: annotating prompt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" stop",
+            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" stop",
+            "timeout": 10,
+            "statusMessage": "Evidence gate: checking Plugin evidence"
+          }
+        ]
+      }
+    ]
+  }
+}
