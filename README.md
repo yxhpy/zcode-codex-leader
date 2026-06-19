@@ -50,7 +50,13 @@ mkdir -p "$ZCACHE"
 git clone https://github.com/yxhpy/zcode-codex-leader /tmp/zcl
 cp -R /tmp/zcl/plugins/zcode-codex-leader/. "$ZCACHE"/
 
-# 2. Register it in the official marketplace manifest
+# 2. Strip the Codex-only manifest. ZCode reads both .zcode-plugin and
+#    .codex-plugin manifests, so leaving both (which each declare hooks)
+#    triggers a "Duplicate plugin hooks file ignored" warning. ZCode only
+#    needs .zcode-plugin; Codex only needs .codex-plugin.
+rm -rf "$ZCACHE/.codex-plugin"
+
+# 3. Register it in the official marketplace manifest
 node -e '
 const fs=require("fs"),p=process.env.HOME+"/.zcode/cli/plugins/marketplaces/zcode-plugins-official/marketplace.json";
 const d=JSON.parse(fs.readFileSync(p,"utf8"));
@@ -59,7 +65,7 @@ d.plugins=[...d.plugins.filter(x=>x.name!=="zcode-codex-leader"),e];
 fs.writeFileSync(p,JSON.stringify(d,null,2));
 '
 
-# 3. Enable it
+# 4. Enable it
 zcode plugins enable zcode-codex-leader
 # (if `zcode` is not on PATH, invoke the CLI directly:
 #  node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs plugins enable zcode-codex-leader)
