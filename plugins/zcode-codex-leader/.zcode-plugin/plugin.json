@@ -9,7 +9,6 @@
   "repository": "https://github.com/yxhpy/zcode-codex-leader",
   "license": "MIT",
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "userConfig": {
     "codex_binary": {
       "type": "string",

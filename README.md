@@ -51,9 +51,11 @@ git clone https://github.com/yxhpy/zcode-codex-leader /tmp/zcl
 cp -R /tmp/zcl/plugins/zcode-codex-leader/. "$ZCACHE"/
 
 # 2. Strip the Codex-only manifest. ZCode reads both .zcode-plugin and
-#    .codex-plugin manifests, so leaving both (which each declare hooks)
-#    triggers a "Duplicate plugin hooks file ignored" warning. ZCode only
-#    needs .zcode-plugin; Codex only needs .codex-plugin.
+#    .codex-plugin, and the .zcode-plugin manifest intentionally omits the
+#    "hooks" field (ZCode auto-scans hooks/hooks.json; declaring it would
+#    trigger "Duplicate plugin hooks file ignored"). Removing .codex-plugin
+#    avoids any cross-product confusion. Codex install uses .codex-plugin
+#    and is unaffected since this copy is ZCode-only.
 rm -rf "$ZCACHE/.codex-plugin"
 
 # 3. Register it in the official marketplace manifest
