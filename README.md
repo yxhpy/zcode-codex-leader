@@ -65,12 +65,14 @@ Then restart ZCode.
 
 > Do **not** manually copy the plugin into a new version-numbered directory. Manual copy-based upgrades leave stale sibling directories (e.g. an old `0.3.0/` next to the new `0.4.0/`), and ZCode reports `plugin_duplicate_id` when the same plugin id appears in more than one cache directory. The installer cleans those up for you.
 
-**Codex** — refresh the marketplace snapshot, then re-add the plugin:
+**Codex** — remove and re-add the plugin so Codex re-reads the current manifest:
 
 ```bash
-codex plugin marketplace upgrade zcode-codex-leader
+codex plugin remove zcode-codex-leader@zcode-codex-leader
 codex plugin add zcode-codex-leader@zcode-codex-leader
 ```
+
+> `codex plugin marketplace upgrade` only works for Git-type marketplaces. The default marketplace registration for this repo is local (filesystem), so to upgrade you remove the installed plugin and re-add it; Codex re-reads the current `.codex-plugin/plugin.json` from the marketplace source directory on re-add. If you registered the marketplace as a Git source instead, use `codex plugin marketplace upgrade zcode-codex-leader` then `codex plugin add zcode-codex-leader@zcode-codex-leader`.
 
 ### Troubleshooting: duplicate plugin id
 
