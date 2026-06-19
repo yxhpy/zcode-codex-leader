@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Cross-platform hook entry wrapper (mirrors superpowers' run-hook.cmd pattern).
+# zcode/codex spawn hooks with spawnSync(command, args) — NOT through a shell —
+# so ${PLUGIN_ROOT} in the command string is NOT expanded and quotes are not
+# stripped. To stay compatible, hooks.json points here (an executable script)
+# and uses ${CLAUDE_PLUGIN_ROOT} (which both zcode and codex expand before
+# spawning). This wrapper resolves the plugin dir and runs leader_hook.ts.
+#
+# Usage: run-hook <session-start|pre-tool-use|user-prompt-submit|stop>
+
+set -euo pipefail
+
+event="${1:-}"
+if [ -z "$event" ]; then
+  echo "run-hook: missing event name" >&2
+  exit 1
+fi
+
+# Resolve plugin root: prefer CLAUDE_PLUGIN_ROOT (injected by zcode/codex),
+# fall back to PLUGIN_ROOT, then to this script's own location.
+plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
+
+exec node --experimental-strip-types "${plugin_root}/scripts/leader_hook.ts" "$event"

@@ -5,8 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" session-start",
-            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" session-start",
             "timeout": 30,
             "statusMessage": "Starting codex app-server worker and injecting leader constitution"
           }
@@ -18,8 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" pre-tool-use",
-            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" pre-tool-use",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-use",
             "timeout": 5,
             "statusMessage": "Leader gate: checking tool use"
           }
@@ -31,8 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" user-prompt-submit",
-            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" user-prompt-submit",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" user-prompt-submit",
             "timeout": 5,
             "statusMessage": "Leader gate: annotating prompt"
           }
@@ -44,8 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types \"${PLUGIN_ROOT}/scripts/leader_hook.ts\" stop",
-            "commandWindows": "node --experimental-strip-types \"%PLUGIN_ROOT%\\scripts\\leader_hook.ts\" stop",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" stop",
             "timeout": 10,
             "statusMessage": "Evidence gate: checking Plugin evidence"
           }
