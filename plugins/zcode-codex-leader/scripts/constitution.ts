@@ -63,8 +63,9 @@ Commands:
       the opencli Browser Bridge. gpt-pro status checks Bridge / login / Pro tier.
       Default --timeout is 900s; if the Pro model is still actively generating
       when the timeout hits, the deadline auto-extends (up to +30min) so a slow
-      deep-reasoning reply is not cut off. Partial responses are saved to --out
-      rather than discarded.
+      deep-reasoning reply is not cut off. The full response is ALWAYS printed to
+      stdout (never hidden behind --out); --out only saves an extra copy to disk.
+      Partial responses are also printed to stdout rather than discarded.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -153,6 +154,13 @@ Worker stdout is the ONLY thing that flows back to ZCode. Keep it tiny. Rules:
    only if it needs the detail.
 4. ZCode treats worker stdout as advisory summary; the on-disk artifact is the
    source of truth for verification.
+5. EXCEPTION — gpt-pro: the Pro model's full response is ALWAYS printed to
+   stdout by the bridge (it is the primary output channel, not a file). Do NOT
+   pass --out expecting stdout to collapse to a path — the bridge ignores that
+   assumption and emits the full text regardless. If you need a disk copy, pass
+   --out; stdout still carries the full text. This exception exists because
+   gpt-pro is a synchronous browser-bridge dispatch whose result must reach the
+   leader directly within the same turn.
 
 ### Synchronous Lightweight Wait (recap)
 

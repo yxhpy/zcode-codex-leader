@@ -327,12 +327,13 @@ function readAssistantSnapshot(deadline?: number): { count: number; text: string
 }
 
 function writeAssistantOutput(text: string, out?: string): void {
+  // Always print the full response to stdout so the leader receives the content
+  // directly via codex_bridge.ts. The --out option only persists an extra copy.
+  process.stdout.write(`${text}\n`);
   if (out) {
     const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
     writeFileSync(absoluteOut, text, "utf8");
-    process.stdout.write(`${absoluteOut}\n`);
-  } else {
-    process.stdout.write(`${text}\n`);
+    process.stderr.write(`gpt-pro: result copy saved to ${absoluteOut}\n`);
   }
 }
 
