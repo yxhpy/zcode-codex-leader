@@ -27,6 +27,10 @@ Measured on a MacBook (gpt-5.5): handshake 17ms, code turn ~11s, vision ~11s, im
 
 Requires: `codex` CLI (v0.141.0+) on PATH or at `~/.hermes/node/bin/codex`, and Node.js 22+ (for native `WebSocket` and `--experimental-strip-types`).
 
+This plugin works on **both Codex and ZCode** — they share the same hook format (`SessionStart` / `PreToolUse` / `UserPromptSubmit` / `Stop`) and the same hook execution contract (`additionalContext`, `revisedPrompt`, exit-code-2 blocking). The plugin ships both `.codex-plugin/plugin.json` and `.zcode-plugin/plugin.json` manifests.
+
+### Install on Codex
+
 ```bash
 # Add this repo as a marketplace
 codex plugin marketplace add https://github.com/yxhpy/zcode-codex-leader
@@ -35,12 +39,40 @@ codex plugin marketplace add https://github.com/yxhpy/zcode-codex-leader
 codex plugin add zcode-codex-leader@zcode-codex-leader
 ```
 
-That's it. The next ZCode/Codex session automatically:
+### Install on ZCode
+
+ZCode has no `marketplace add` command, so installation is a manual copy + register:
+
+```bash
+# 1. Clone the plugin into ZCode's plugin cache
+ZCACHE="$HOME/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.1.0"
+mkdir -p "$ZCACHE"
+git clone https://github.com/yxhpy/zcode-codex-leader /tmp/zcl
+cp -R /tmp/zcl/plugins/zcode-codex-leader/. "$ZCACHE"/
+
+# 2. Register it in the official marketplace manifest
+node -e '
+const fs=require("fs"),p=process.env.HOME+"/.zcode/cli/plugins/marketplaces/zcode-plugins-official/marketplace.json";
+const d=JSON.parse(fs.readFileSync(p,"utf8"));
+const e={cachePath:process.env.HOME+"/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.1.0",name:"zcode-codex-leader",source:"filesystem",version:"0.1.0"};
+d.plugins=[...d.plugins.filter(x=>x.name!=="zcode-codex-leader"),e];
+fs.writeFileSync(p,JSON.stringify(d,null,2));
+'
+
+# 3. Enable it
+zcode plugins enable zcode-codex-leader
+# (if `zcode` is not on PATH, invoke the CLI directly:
+#  node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs plugins enable zcode-codex-leader)
+```
+
+After install, the next Codex/ZCode session automatically:
 1. Injects the leader constitution into context (`SessionStart`).
 2. Starts a resident app-server worker.
 3. Hard-blocks direct edits/writes (`PreToolUse`).
 4. Annotates each prompt with a leader reminder (`UserPromptSubmit`).
 5. Refuses completion without `Plugin evidence:` when work was dispatched (`Stop`).
+
+> Note: ZCode loads plugins at app startup. If ZCode is already running, restart it (or start a new session) so the newly enabled plugin's hooks take effect.
 
 ## How the leader works
 
