@@ -86,9 +86,30 @@ async function isAlive(s: SessionState): Promise<boolean> {
 
 // Start a fresh detached worker, parse its ws URL from stderr, persist state.
 // Returns the new session state, or throws on failure.
+//
+// The worker is deliberately stripped to its core capability set: shell, file
+// read/write/edit, and search. All Codex plugins, MCP servers, memories,
+// multi-agent spawning, plugin hooks, and goals are disabled via -c config
+// overrides so the worker cannot invoke external tools (browser, computer-use,
+// cloudflare, etc.) that would slow it down or pollute its output.
 async function startWorker(): Promise<SessionState> {
   const bin = codexBinary();
-  const child: ChildProcess = spawn(bin, ["app-server", "--listen", "ws://127.0.0.1:0"], {
+  const workerArgs = [
+    "app-server", "--listen", "ws://127.0.0.1:0",
+    // --- Disable all plugins (browser, chrome, computer-use, cloudflare, documents, etc.)
+    "-c", "features.plugins=false",
+    // --- Disable MCP servers (node_repl / browser backends)
+    "-c", "mcp_servers={}",
+    // --- Disable memories (avoids stale context injection)
+    "-c", "features.memories=false",
+    // --- Disable multi-agent spawning (worker must not spawn sub-agents)
+    "-c", "features.multi_agent=false",
+    // --- Disable plugin hooks on the worker (hooks are a leader concern)
+    "-c", "features.plugin_hooks=false",
+    // --- Disable goals (worker receives bounded packets, not goals)
+    "-c", "features.goals=false",
+  ];
+  const child: ChildProcess = spawn(bin, workerArgs, {
     stdio: ["pipe", "pipe", "pipe"],
     detached: true,          // survive parent exit
     env: { ...process.env },

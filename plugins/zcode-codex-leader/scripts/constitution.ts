@@ -132,14 +132,18 @@ capability or the bridge: codex must not call agy / gpt-pro / opencli /
 codex_bridge.ts; agy must not call codex / gpt-pro; gpt-pro must not call codex /
 agy. Each worker stays inside its own lane. ZCode is the ONLY router.
 
-This is a TEXT constitution constraint, not a sandbox — the codex worker has
-shell access and COULD technically call opencli/agy. Enforcement is by packet
-contract: every dispatch packet MUST state the worker's allowed tools explicitly
-and forbid the others. Example packet clause: 'You may only use <shell + edit on
-the named files>. Do NOT run opencli, agy, codex_bridge.ts, or any browser
-automation — those are a different worker's lane.' ZCode must not ASSIGN
-out-of-lane work either: do not ask codex to drive opencli, do not ask gpt-pro
-to edit repo files.
+The codex worker is started with ALL Codex plugins, MCP servers, memories,
+multi-agent spawning, plugin hooks, and goals DISABLED via -c config overrides.
+It retains only its core capability set: shell (read/write/grep/find), file
+edit, and search. It cannot invoke browser, computer-use, cloudflare, node_repl,
+or any other plugin-provided tool. This keeps the worker fast and its output
+clean — no plugin context bloat, no stray MCP tool calls. Enforcement is both
+config-level (the overrides above) AND packet-contract-level: every dispatch
+packet MUST state the worker's allowed tools explicitly and forbid the others.
+Example packet clause: 'You may only use <shell + edit on the named files>. Do
+NOT run opencli, agy, codex_bridge.ts, or any browser automation — those are a
+different worker's lane.' ZCode must not ASSIGN out-of-lane work either: do not
+ask codex to drive opencli, do not ask gpt-pro to edit repo files.
 
 ### Output Discipline (HARD — protect leader context)
 
