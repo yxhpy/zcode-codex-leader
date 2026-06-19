@@ -1,0 +1,657 @@
+#!/usr/bin/env -S node --experimental-strip-types
+
+import { spawnSync } from "child_process";
+import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync } from "fs";
+import { basename, extname, isAbsolute, resolve } from "path";
+
+type RunResult = {
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  error?: Error;
+};
+
+const FALLBACK_OPENCLI = "/opt/homebrew/bin/opencli";
+const MAX_FILE_BYTES = 200 * 1024;
+const CHATGPT_URL = "https://chatgpt.com";
+const ASSISTANT_COUNT_JS = "(()=>document.querySelectorAll('[data-message-author-role=assistant]').length)()";
+const EXTRACT_NEW_ASSISTANT_JS =
+  "(()=>{const m=[...document.querySelectorAll('[data-message-author-role=assistant]')];const count=m.length;return JSON.stringify({count,text:count?m[count-1].innerText:''});})()";
+const IS_GENERATING_JS =
+  "(()=>Boolean(document.querySelector('button[data-testid=\"stop-button\"],button[aria-label*=\"停止\"],button[aria-label*=\"Stop\"]')))()";
+const SUBMIT_PROMPT_JS =
+  "(()=>{const b=document.querySelector('[data-testid=\"send-button\"],button[aria-label*=\"发送\"],button[aria-label*=\"Send\"]');if(!b)return JSON.stringify({ok:false,error:'missing send button'});if(b.disabled||b.getAttribute('aria-disabled')==='true')return JSON.stringify({ok:false,error:'send button disabled'});b.click();return JSON.stringify({ok:true});})()";
+const PROMPT_SENT_JS =
+  "(()=>{const generating=Boolean(document.querySelector('button[data-testid=\"stop-button\"],button[aria-label*=\"停止\"],button[aria-label*=\"Stop\"]'));const assistantCount=document.querySelectorAll('[data-message-author-role=assistant]').length;const composer=(document.querySelector('#prompt-textarea')?.innerText||'').trim();return JSON.stringify({sent:generating||assistantCount>0||location.pathname.startsWith('/c/'),generating,assistantCount,composerLength:composer.length});})()";
+const CLEAR_COMPOSER_JS =
+  "(()=>{const el=document.querySelector('#prompt-textarea');if(!el)return JSON.stringify({ok:false,error:'missing composer'});el.innerHTML='';el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));const textarea=document.querySelector('textarea[name=\"prompt-textarea\"]');if(textarea){textarea.value='';textarea.dispatchEvent(new Event('input',{bubbles:true}));}const input=document.querySelector('#upload-files');if(input){input.files=new DataTransfer().files;input.dispatchEvent(new Event('change',{bubbles:true}));}for(const b of [...document.querySelectorAll('[aria-label*=\"移除文件\"],[aria-label*=\"Remove file\"],[aria-label*=\"remove file\"]')]){b.click();}return JSON.stringify({ok:true});})()";
+
+function usage(): string {
+  return [
+    "Usage:",
+    "  gpt_pro.ts help",
+    "  gpt_pro.ts status",
+    "  gpt_pro.ts ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
+    "",
+    "Environment:",
+    "  OPENCLI_BIN  Path to opencli binary. Defaults to PATH lookup, then /opt/homebrew/bin/opencli.",
+  ].join("\n");
+}
+
+function log(message: string): void {
+  process.stderr.write(`${message}\n`);
+}
+
+function canExecute(file: string): boolean {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveOpencliBin(): string {
+  if (process.env.OPENCLI_BIN) {
+    return process.env.OPENCLI_BIN;
+  }
+
+  const pathValue = process.env.PATH || "";
+  for (const entry of pathValue.split(":")) {
+    if (!entry) {
+      continue;
+    }
+    const candidate = resolve(entry, "opencli");
+    if (existsSync(candidate) && canExecute(candidate)) {
+      return candidate;
+    }
+  }
+
+  return FALLBACK_OPENCLI;
+}
+
+const opencliBin = resolveOpencliBin();
+
+function runCommand(bin: string, args: string[], timeoutMs = 60000): RunResult {
+  const result = spawnSync(bin, args, {
+    encoding: "utf8",
+    shell: false,
+    maxBuffer: 10 * 1024 * 1024,
+    timeout: timeoutMs,
+  });
+
+  return {
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+    status: result.status,
+    error: result.error,
+  };
+}
+
+function opencliTimeoutMs(args: string[]): number {
+  if (args[0] === "doctor") {
+    return 15000;
+  }
+  if (args[0] === "browser") {
+    switch (args[1]) {
+      case "state":
+      case "wait":
+      case "type":
+      case "keys":
+      case "click":
+      case "open":
+        return 30000;
+      case "eval":
+        return 45000;
+    }
+  }
+  return 60000;
+}
+
+function runOpencli(args: string[], timeoutMs = opencliTimeoutMs(args)): RunResult {
+  return runCommand(opencliBin, args, timeoutMs);
+}
+
+function runOpencliWithinDeadline(args: string[], deadline: number): RunResult {
+  requireBeforeDeadline(deadline, `opencli ${args.join(" ")}`);
+  const remainingMs = Math.max(1, deadline - Date.now());
+  return runOpencli(args, Math.min(opencliTimeoutMs(args), remainingMs));
+}
+
+function outputOf(result: RunResult): string {
+  return `${result.stdout}\n${result.stderr}`;
+}
+
+function commandFailed(result: RunResult): boolean {
+  return Boolean(result.error) || result.status !== 0;
+}
+
+function isBridgeConnected(result: RunResult): boolean {
+  if (commandFailed(result)) {
+    return false;
+  }
+  const text = outputOf(result);
+  if (/\bnot\s+connected(?:\s+in)?\b/i.test(text) || /\bdisconnected\b/i.test(text)) {
+    return false;
+  }
+  return /\bBridge\b[\s\S]*\bconnected\b/i.test(text) || /\bconnected\b/i.test(text);
+}
+
+function stateText(deadline?: number): RunResult {
+  const args = ["browser", "state"];
+  return deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+}
+
+function findComposerIndex(state: string): string | null {
+  const lines = state.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/\[(\d+)\]<[^>]*\bid=prompt-textarea\b[^>]*\brole=textbox\b/i);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  for (const line of lines) {
+    const match = line.match(/\[(\d+)\]<[^>]*\brole=textbox\b[^>]*\bid=prompt-textarea\b/i);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function parseStatusState(state: string): { loggedIn: boolean; plan: "pro" | false } {
+  const lines = state.split(/\r?\n/);
+  const profileIndex = lines.findIndex((line) => /accounts-profile-button/i.test(line));
+  if (profileIndex === -1) {
+    return { loggedIn: false, plan: false };
+  }
+
+  const nearby = lines.slice(Math.max(0, profileIndex - 5), profileIndex + 8).join("\n");
+  return {
+    loggedIn: true,
+    plan: /\bPro\b/i.test(nearby) ? "pro" : false,
+  };
+}
+
+function statusCommand(): number {
+  const doctor = runOpencli(["doctor"]);
+  const bridge = isBridgeConnected(doctor);
+  let loggedIn = false;
+  let plan: "pro" | false = false;
+
+  try {
+    const opened = runOpencli(["browser", "open", CHATGPT_URL]);
+    if (commandFailed(opened)) {
+      throw new Error(opened.error?.message || opened.stderr || "opencli browser open failed");
+    }
+
+    const waited = runOpencli(["browser", "wait", "time", "5"]);
+    if (commandFailed(waited)) {
+      throw new Error(waited.error?.message || waited.stderr || "opencli browser wait failed");
+    }
+
+    const state = stateText();
+    if (commandFailed(state)) {
+      throw new Error(state.error?.message || state.stderr || "opencli browser state failed");
+    }
+
+    const parsed = parseStatusState(state.stdout || state.stderr);
+    loggedIn = parsed.loggedIn;
+    plan = parsed.plan;
+
+    process.stdout.write(`${JSON.stringify({ bridge, loggedIn, plan })}\n`);
+    return bridge ? 0 : 2;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(message);
+    process.stdout.write(`${JSON.stringify({ bridge, loggedIn, plan, error: message })}\n`);
+    return 2;
+  }
+}
+
+function parseAskArgs(args: string[]): { prompt: string; files: string[]; out?: string; timeoutSec: number } {
+  let prompt: string | undefined;
+  let promptFile: string | undefined;
+  const files: string[] = [];
+  let out: string | undefined;
+  let timeoutSec = 300;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--prompt-file") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --prompt-file");
+      }
+      promptFile = value;
+      i += 1;
+      continue;
+    }
+
+    if (arg === "--out") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --out");
+      }
+      out = value;
+      i += 1;
+      continue;
+    }
+
+    if (arg === "--file") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --file");
+      }
+      files.push(value);
+      i += 1;
+      continue;
+    }
+
+    if (arg === "--timeout") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --timeout");
+      }
+      timeoutSec = Number(value);
+      if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+        throw new Error("--timeout must be a positive number of seconds");
+      }
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--")) {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+
+    if (prompt !== undefined) {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+    prompt = arg;
+  }
+
+  if (promptFile) {
+    prompt = readFileSync(promptFile, "utf8");
+  }
+
+  if ((prompt === undefined || prompt.length === 0) && files.length === 0) {
+    throw new Error("missing prompt or file");
+  }
+
+  return { prompt: prompt || "", files, out, timeoutSec };
+}
+
+function requireSuccess(result: RunResult, label: string): void {
+  if (!commandFailed(result)) {
+    return;
+  }
+
+  const details = [
+    result.error?.message,
+    result.stderr.trim(),
+    result.stdout.trim(),
+    result.status === null ? "exit status: null" : `exit status: ${result.status}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  throw new Error(`${label} failed${details ? `\n${details}` : ""}`);
+}
+
+function requireBeforeDeadline(deadline: number, label = "operation"): void {
+  if (Date.now() >= deadline) {
+    throw new Error(`timed out before ${label}`);
+  }
+}
+
+function readAssistantSnapshot(deadline?: number): { count: number; text: string } | null {
+  const args = ["browser", "eval", EXTRACT_NEW_ASSISTANT_JS];
+  const evaluated = deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+  if (commandFailed(evaluated)) {
+    log(`opencli browser eval failed: ${evaluated.error?.message || evaluated.stderr || evaluated.status}`);
+    return null;
+  }
+  try {
+    const payload = JSON.parse(evaluated.stdout.trim()) as { count?: number; text?: string };
+    return {
+      count: typeof payload.count === "number" ? payload.count : 0,
+      text: typeof payload.text === "string" ? payload.text.trim() : "",
+    };
+  } catch {
+    log(`assistant extraction returned invalid JSON\n${evaluated.stdout.trim() || evaluated.stderr.trim()}`);
+    return null;
+  }
+}
+
+function writeAssistantOutput(text: string, out?: string): void {
+  if (out) {
+    const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
+    writeFileSync(absoluteOut, text, "utf8");
+    process.stdout.write(`${absoluteOut}\n`);
+  } else {
+    process.stdout.write(`${text}\n`);
+  }
+}
+
+function mimeTypeForPath(filePath: string): string {
+  switch (extname(filePath).toLowerCase()) {
+    case ".ts":
+    case ".tsx":
+      return "text/x-typescript";
+    case ".js":
+    case ".jsx":
+      return "text/javascript";
+    case ".py":
+      return "text/x-python";
+    case ".json":
+      return "application/json";
+    case ".md":
+      return "text/markdown";
+    default:
+      return "text/plain";
+  }
+}
+
+function uploadFiles(filePaths: string[], deadline: number): void {
+  requireBeforeDeadline(deadline, "clear uploads");
+  const clearJs = `(()=>{const i=document.querySelector('#upload-files');if(i){const dt=new DataTransfer();i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));}return JSON.stringify({ok:true,remaining:i&&i.files?i.files.length:0});})()`;
+  const cleared = runOpencliWithinDeadline(["browser", "eval", clearJs], deadline);
+  requireSuccess(cleared, "opencli browser eval clear uploads");
+  requireBeforeDeadline(deadline, "wait after clear uploads");
+  requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after clear uploads");
+  let clearPayload: { remaining?: number };
+  try {
+    clearPayload = JSON.parse(cleared.stdout.trim());
+  } catch {
+    throw new Error(`clear uploads returned invalid JSON\n${cleared.stdout.trim() || cleared.stderr.trim()}`);
+  }
+  if ((clearPayload.remaining || 0) > 0) {
+    log(`warning: could not fully clear existing attachments, remaining=${clearPayload.remaining}`);
+  }
+
+  for (const filePath of filePaths) {
+    requireBeforeDeadline(deadline, `upload ${basename(filePath)}`);
+    const stat = statSync(filePath);
+    if (stat.size > MAX_FILE_BYTES) {
+      throw new Error(`file too large for --file (max 200KB): ${filePath} (${stat.size} bytes)`);
+    }
+    const prefix = readFileSync(filePath).subarray(0, 8192);
+    if (prefix.includes(0x00)) {
+      throw new Error(`binary file not supported by --file (text only): ${filePath}`);
+    }
+    const content = readFileSync(filePath, "utf8");
+    const name = basename(filePath);
+    const mimeType = mimeTypeForPath(filePath);
+    const js = `(()=>{const i=document.querySelector('#upload-files');if(!i)return JSON.stringify({ok:false,error:'missing #upload-files'});const dt=new DataTransfer();for(const file of Array.from(i.files||[])){dt.items.add(file);}dt.items.add(new File([${JSON.stringify(content)}],${JSON.stringify(name)},{type:${JSON.stringify(mimeType)}}));i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({ok:true,name:${JSON.stringify(name)},size:${Buffer.byteLength(content, "utf8")}});})()`;
+    const uploaded = runOpencliWithinDeadline(["browser", "eval", js], deadline);
+    requireSuccess(uploaded, `opencli browser eval upload ${name}`);
+    let payload: { ok?: boolean; error?: string };
+    try {
+      payload = JSON.parse(uploaded.stdout.trim());
+    } catch {
+      throw new Error(`upload ${name} returned invalid JSON\n${uploaded.stdout.trim() || uploaded.stderr.trim()}`);
+    }
+    if (!payload.ok) {
+      throw new Error(`upload ${name} failed${payload.error ? `: ${payload.error}` : ""}`);
+    }
+    requireBeforeDeadline(deadline, `wait after upload ${name}`);
+    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after upload");
+  }
+
+  requireBeforeDeadline(deadline, "upload verification");
+  const expectedNames = filePaths.map((filePath) => basename(filePath));
+  const verifyJs = `(()=>{const input=document.querySelector('#upload-files');const filesLength=input&&input.files?input.files.length:0;const bodyText=document.body?document.body.innerText:'';const elements=[...document.querySelectorAll('[aria-label]')].map((el)=>el.getAttribute('aria-label')||'');const hasRemove=elements.some((label)=>label.includes('移除')||label.includes('Remove')||label.includes('remove'));const names=${JSON.stringify(expectedNames)};const missingNames=names.filter((name)=>!bodyText.includes(name)&&!elements.some((label)=>label.includes(name)));return JSON.stringify({filesLength,expected:${filePaths.length},hasRemove,missingNames});})()`;
+  const verified = runOpencliWithinDeadline(["browser", "eval", verifyJs], deadline);
+  requireSuccess(verified, "opencli browser eval upload verification");
+  let payload: { filesLength?: number; expected?: number; hasRemove?: boolean; missingNames?: string[] };
+  try {
+    payload = JSON.parse(verified.stdout.trim());
+  } catch {
+    throw new Error(`upload verification returned invalid JSON\n${verified.stdout.trim() || verified.stderr.trim()}`);
+  }
+  if (payload.filesLength !== filePaths.length) {
+    throw new Error(`upload verification failed: files.length=${payload.filesLength}, expected=${filePaths.length}`);
+  }
+  if (!payload.hasRemove && payload.missingNames && payload.missingNames.length > 0) {
+    throw new Error(`upload verification failed: missing uploaded file UI for ${payload.missingNames.join(", ")}`);
+  }
+}
+
+function sendPrompt(deadline: number): void {
+  requireBeforeDeadline(deadline, "send prompt");
+  requireSuccess(runOpencliWithinDeadline(["browser", "keys", "Enter"], deadline), "opencli browser keys Enter");
+  requireBeforeDeadline(deadline, "wait after Enter");
+  requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after Enter");
+
+  requireBeforeDeadline(deadline, "prompt sent check");
+  const sentCheck = runOpencliWithinDeadline(["browser", "eval", PROMPT_SENT_JS], deadline);
+  requireSuccess(sentCheck, "opencli browser eval prompt sent check");
+  let sentPayload: { sent?: boolean; composerLength?: number };
+  try {
+    sentPayload = JSON.parse(sentCheck.stdout.trim());
+  } catch {
+    throw new Error(`prompt sent check returned invalid JSON\n${sentCheck.stdout.trim() || sentCheck.stderr.trim()}`);
+  }
+  if (sentPayload.sent || sentPayload.composerLength === 0) {
+    return;
+  }
+
+  let lastError = "";
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    requireBeforeDeadline(deadline, "click send");
+    const submitted = runOpencliWithinDeadline(["browser", "eval", SUBMIT_PROMPT_JS], deadline);
+    requireSuccess(submitted, "opencli browser eval click send");
+    let submitPayload: { ok?: boolean; error?: string };
+    try {
+      submitPayload = JSON.parse(submitted.stdout.trim());
+    } catch {
+      throw new Error(`click send returned invalid JSON\n${submitted.stdout.trim() || submitted.stderr.trim()}`);
+    }
+    if (submitPayload.ok) {
+      return;
+    }
+    lastError = submitPayload.error || "unknown error";
+    requireBeforeDeadline(deadline, "wait for send button");
+    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait for send button");
+  }
+  throw new Error(`click send failed${lastError ? `: ${lastError}` : ""}`);
+}
+
+function clearComposer(deadline?: number): void {
+  const args = ["browser", "eval", CLEAR_COMPOSER_JS];
+  const cleared = deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+  requireSuccess(cleared, "opencli browser eval clear composer");
+  let payload: { ok?: boolean; error?: string };
+  try {
+    payload = JSON.parse(cleared.stdout.trim());
+  } catch {
+    throw new Error(`clear composer returned invalid JSON\n${cleared.stdout.trim() || cleared.stderr.trim()}`);
+  }
+  if (!payload.ok) {
+    throw new Error(`clear composer failed${payload.error ? `: ${payload.error}` : ""}`);
+  }
+}
+
+function getComposerIndex(deadline?: number): string | null {
+  const first = stateText(deadline);
+  if (!commandFailed(first)) {
+    const found = findComposerIndex(outputOf(first));
+    if (found) {
+      return found;
+    }
+  } else {
+    log(`opencli browser state failed: ${first.error?.message || first.stderr || first.status}`);
+  }
+
+  const second = stateText(deadline);
+  if (commandFailed(second)) {
+    log(`opencli browser state retry failed: ${second.error?.message || second.stderr || second.status}`);
+    return null;
+  }
+
+  return findComposerIndex(outputOf(second));
+}
+
+function askCommand(args: string[]): number {
+  let parsed: { prompt: string; files: string[]; out?: string; timeoutSec: number };
+  try {
+    parsed = parseAskArgs(args);
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error));
+    log(usage());
+    return 2;
+  }
+
+  const deadline = Date.now() + parsed.timeoutSec * 1000;
+  try {
+    const doctor = runOpencliWithinDeadline(["doctor"], deadline);
+    if (!isBridgeConnected(doctor)) {
+      log("opencli Bridge is not connected.");
+      if (doctor.error) {
+        log(doctor.error.message);
+      }
+      if (doctor.stderr.trim()) {
+        log(doctor.stderr.trim());
+      }
+      return 2;
+    }
+
+    requireSuccess(runOpencliWithinDeadline(["browser", "open", CHATGPT_URL], deadline), "opencli browser open");
+    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+
+    const composerIndex = getComposerIndex(deadline);
+    if (!composerIndex) {
+      throw new Error("could not find ChatGPT composer element id=prompt-textarea role=textbox");
+    }
+
+    clearComposer(deadline);
+    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after clear composer");
+
+    if (parsed.files.length > 0) {
+      uploadFiles(parsed.files, deadline);
+    }
+
+    const prompt = parsed.prompt || (parsed.files.length > 0 ? "请审查上传的文件。" : "");
+    if (prompt) {
+      requireSuccess(runOpencliWithinDeadline(["browser", "type", composerIndex, prompt], deadline), "opencli browser type");
+    }
+
+    const baselineCountResult = runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    requireSuccess(baselineCountResult, "opencli browser eval assistant baseline count");
+    const baselineCount = Number(baselineCountResult.stdout.trim());
+    if (!Number.isFinite(baselineCount)) {
+      throw new Error(`assistant baseline count returned invalid value\n${baselineCountResult.stdout.trim() || baselineCountResult.stderr.trim()}`);
+    }
+
+    sendPrompt(deadline);
+
+    const sentAt = Date.now();
+    const generationStartDeadline = Math.min(deadline, sentAt + 30000);
+    let sawGenerating = false;
+    let lastText = "";
+    let currentText = "";
+    let currentCount = baselineCount;
+    let stableReads = 0;
+
+    while (Date.now() < generationStartDeadline) {
+      const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
+      if (!commandFailed(generating) && generating.stdout.trim() === "true") {
+        sawGenerating = true;
+        break;
+      }
+      if (commandFailed(generating)) {
+        log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
+      }
+
+      const snapshot = readAssistantSnapshot(deadline);
+      if (snapshot) {
+        currentCount = snapshot.count;
+        currentText = snapshot.count > baselineCount ? snapshot.text : "";
+      }
+
+      if (Date.now() < generationStartDeadline) {
+        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+        if (commandFailed(waited)) {
+          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+        }
+      }
+    }
+
+    while (Date.now() < deadline) {
+      const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
+      if (!commandFailed(generating) && generating.stdout.trim() === "true") {
+        sawGenerating = true;
+        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+        if (commandFailed(waited)) {
+          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+        }
+        continue;
+      }
+      if (commandFailed(generating)) {
+        log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
+      }
+
+      const snapshot = readAssistantSnapshot(deadline);
+      if (snapshot) {
+        currentCount = snapshot.count;
+        currentText = snapshot.count > baselineCount ? snapshot.text : "";
+      }
+
+      if (sawGenerating) {
+        if (currentCount > baselineCount && currentText) {
+          writeAssistantOutput(currentText, parsed.out);
+          return 0;
+        }
+      } else if (currentCount > baselineCount && currentText) {
+        stableReads = currentText === lastText ? stableReads + 1 : 1;
+        lastText = currentText;
+        if (stableReads >= 3 && Date.now() - sentAt >= 20000) {
+          writeAssistantOutput(currentText, parsed.out);
+          return 0;
+        }
+      }
+
+      if (Date.now() < deadline) {
+        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+        if (commandFailed(waited)) {
+          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+        }
+      }
+    }
+
+    log("timed out waiting for assistant response to stabilize.");
+    if (currentText || lastText) {
+      log("last collected assistant text:");
+      log(currentText || lastText);
+    }
+    return 2;
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error));
+    return 2;
+  }
+}
+
+function main(): number {
+  const [command, ...args] = process.argv.slice(2);
+
+  if (!command || command === "help" || command === "--help" || command === "-h") {
+    process.stdout.write(`${usage()}\n`);
+    return 0;
+  }
+
+  if (command === "status") {
+    return statusCommand();
+  }
+
+  if (command === "ask") {
+    return askCommand(args);
+  }
+
+  log(`unknown command: ${command}`);
+  log(usage());
+  return 2;
+}
+
+process.exitCode = main();

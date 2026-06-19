@@ -16,6 +16,10 @@
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
 //       Dispatch a task to the local Antigravity CLI (agy) — long-context,
 //       multimodal, live web.
+//   gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+//   gpt-pro status
+//   gpt-pro help
+//       Dispatch to ChatGPT web Pro via opencli Browser Bridge.
 //
 // Each successful call bumps the session dispatch count and prints a trailing
 // "Plugin evidence:" line so ZCode can aggregate evidence for the Stop gate.
@@ -72,6 +76,28 @@ function parseAgyTimeoutMs(value: string): number {
     case "ms": return n;
     default: return 20 * 60 * 1000;
   }
+}
+
+function rawArgsAfterSubcommand(subcommand: string): string[] {
+  const argv = process.argv.slice(2);
+  const index = argv.indexOf(subcommand);
+  return index === -1 ? [] : argv.slice(index + 1);
+}
+
+function collectRepeatedRawOption(rawArgs: string[], option: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < rawArgs.length; i += 1) {
+    if (rawArgs[i] !== option) {
+      continue;
+    }
+    const value = rawArgs[i + 1];
+    if (!value || value.startsWith("--")) {
+      fail(`gpt-pro ask missing value for ${option}`);
+    }
+    values.push(value);
+    i += 1;
+  }
+  return values;
 }
 
 // ask: code generation / parsing, optionally with image + structured output schema
@@ -238,6 +264,74 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
   bumpDispatch();
 }
 
+// gpt-pro: dispatch to ChatGPT web Pro via opencli Browser Bridge
+async function cmdGptPro(positional: string[], flags: Record<string, string>): Promise<void> {
+  const command = positional[0];
+  const args: string[] = [];
+  if (command === "status") {
+    args.push("status");
+  } else if (command === "help" || command === "--help" || command === "-h") {
+    args.push("help");
+  } else if (command === "ask") {
+    const prompt = positional[1];
+    const promptFile = flags["prompt-file"];
+    const filePaths = collectRepeatedRawOption(rawArgsAfterSubcommand("gpt-pro"), "--file");
+    if (promptFile) {
+      if (prompt) fail("gpt-pro ask accepts either <prompt> or --prompt-file, not both");
+      args.push("ask", "--prompt-file", promptFile);
+    } else {
+      if (!prompt && filePaths.length === 0) fail("gpt-pro ask requires a prompt, --prompt-file, or --file");
+      if (prompt) args.push("ask", prompt);
+      else args.push("ask");
+    }
+    for (const filePath of filePaths) args.push("--file", filePath);
+    if (flags.out) args.push("--out", flags.out);
+    if (flags.timeout) args.push("--timeout", flags.timeout);
+  } else {
+    fail("gpt-pro requires status, ask, or help");
+  }
+
+  const scriptDir = path.dirname(new URL(import.meta.url).pathname);
+  const gptProPath = path.join(scriptDir, "gpt_pro.ts");
+  const child = spawn("node", ["--experimental-strip-types", gptProPath, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+    cwd: process.cwd(),
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+  child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutForHardLimit = flags.timeout && /^\d+$/.test(flags.timeout) ? `${flags.timeout}s` : flags.timeout;
+  const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLimit) : 300000) + 30000;
+  const code = await new Promise<number | null>((resolve) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+    }, hardTimeoutMs);
+    child.on("close", (closeCode) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      resolve(closeCode);
+    });
+    child.on("error", (e) => fail(`failed to start gpt-pro: ${e.message}`));
+  });
+
+  if (timedOut) fail(`gpt-pro timed out after ${hardTimeoutMs}ms`);
+  if (code !== 0) {
+    process.stderr.write(Buffer.concat(stderr).toString());
+    fail(`gpt-pro exited with code ${code}`);
+  }
+
+  process.stdout.write(Buffer.concat(stdout));
+  process.stdout.write("Plugin evidence: gpt-pro via codex_bridge.ts — exit 0\n");
+  bumpDispatch();
+}
+
 async function main(): Promise<void> {
   const { sub, positional, flags } = parseArgs(process.argv.slice(2));
   switch (sub) {
@@ -247,6 +341,7 @@ async function main(): Promise<void> {
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
     case "agy":            return cmdAgy(positional, flags);
+    case "gpt-pro":        return cmdGptPro(positional, flags);
     case "help":
     case "--help":
     case "-h":
@@ -269,6 +364,10 @@ Usage:
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
   codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
+  codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+  codex_bridge gpt-pro status
+  codex_bridge gpt-pro help
+      Dispatch to ChatGPT web Pro via opencli Browser Bridge.
   codex_bridge help
 
 Each command prints a trailing "Plugin evidence:" line for the Stop gate.

@@ -58,6 +58,9 @@ Commands:
       Direct MCP tool call without a full turn.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch to local Antigravity CLI (agy) for long-context / multimodal / live-web work.
+  gpt-pro ask <prompt> [--out <file>] [--timeout <sec>]
+      Dispatch a hard code review or deep question to ChatGPT web (Pro model) via
+      the opencli Browser Bridge. gpt-pro status checks Bridge / login / Pro tier.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -86,7 +89,7 @@ those are dispatched.
 ## Evidence Gate (enforced by the Stop hook)
 
 Your final completion summary MUST include one or more "Plugin evidence:" lines, each
-naming the dispatched capability (ask / vision / generate-image / mcp-tool) and the
+naming the dispatched capability (ask / vision / generate-image / mcp-tool / agy / gpt-pro) and the
 exact command, turn id, transcript, or artifact path. The Stop hook REFUSES completion
 when dispatched work has no Plugin evidence line — even if you report the work as done.
 Copy the evidence lines that codex_bridge.ts prints; do not invent them.
@@ -98,6 +101,62 @@ action: deleting/overwriting/mass-renaming, migrations or dependency upgrades,
 deploy/publish, touching credentials or production data, spawning many agents, or paid
 external calls. If approval is denied or unavailable, continue only with safe read-only
 planning, local drafts, or non-destructive checks.
+
+## Synchronous Lightweight Wait (SLW)
+
+Every dispatch MUST be dispatched and recovered within the SAME ZCode turn; a
+dispatch still in-flight when a turn ends is a violation. The bridge call runs
+foreground — the Bash call blocks until codex_bridge.ts exits and returns its
+stdout, which IS the synchronous wait. Rules: NEVER pass run_in_background to a
+codex_bridge.ts dispatch (always foreground); for long tasks the bridge
+subcommand blocks internally and returns when done, so do not yield the turn
+mid-dispatch; if a dispatch would exceed the Bash ceiling, poll in-turn via a
+bridge primitive — never hand an in-flight dispatch to a later turn.
+
+## Capability Routing
+
+ZCode routes each task to the right isolated worker and never does the work:
+substantive implementation / code parsing -> codex (ask / ask-file); long-context
+/ multimodal / live-web research -> agy; hardest code review / deep research on
+the strongest Pro model -> gpt-pro.
+
+### Worker Boundary (HARD — no cross-capability calls)
+
+Capabilities are PEER-LEVEL and ISOLATED. A worker MUST NOT invoke another
+capability or the bridge: codex must not call agy / gpt-pro / opencli /
+codex_bridge.ts; agy must not call codex / gpt-pro; gpt-pro must not call codex /
+agy. Each worker stays inside its own lane. ZCode is the ONLY router.
+
+This is a TEXT constitution constraint, not a sandbox — the codex worker has
+shell access and COULD technically call opencli/agy. Enforcement is by packet
+contract: every dispatch packet MUST state the worker's allowed tools explicitly
+and forbid the others. Example packet clause: 'You may only use <shell + edit on
+the named files>. Do NOT run opencli, agy, codex_bridge.ts, or any browser
+automation — those are a different worker's lane.' ZCode must not ASSIGN
+out-of-lane work either: do not ask codex to drive opencli, do not ask gpt-pro
+to edit repo files.
+
+### Output Discipline (HARD — protect leader context)
+
+Worker stdout is the ONLY thing that flows back to ZCode. Keep it tiny. Rules:
+1. Default: any dispatch whose raw output may exceed ~200 words MUST write the
+   full output to a file (--out / ask-file / a temp path) and print ONLY the
+   path plus a <=200-word conclusion to stdout.
+2. ZCode's dispatch prompt MUST instruct the worker of this: 'Write detailed
+   output to <file>; print only the path and a <=200-word summary to stdout.'
+3. Never dump raw command help, full DOM/state snapshots, full file contents,
+   or full LLM responses to stdout — those go to a file. ZCode reads the file
+   only if it needs the detail.
+4. ZCode treats worker stdout as advisory summary; the on-disk artifact is the
+   source of truth for verification.
+
+### Synchronous Lightweight Wait (recap)
+
+Foreground dispatch only; NEVER run_in_background on a codex_bridge.ts call. The
+Bash call blocks until the bridge exits — that blocking IS the wait. Long tasks
+(agy, gpt-pro) block inside the bridge subcommand; do not yield the turn
+mid-dispatch. If a dispatch would exceed the Bash ceiling, poll in-turn via a
+read on the result file — never hand an in-flight dispatch to a later turn.
 
 ## Hard Stop
 
