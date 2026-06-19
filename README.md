@@ -45,7 +45,7 @@ ZCode has no `marketplace add` command, so installation is a manual copy + regis
 
 ```bash
 # 1. Clone the plugin into ZCode's plugin cache
-ZCACHE="$HOME/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.1.0"
+ZCACHE="$HOME/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.2.0"
 mkdir -p "$ZCACHE"
 git clone https://github.com/yxhpy/zcode-codex-leader /tmp/zcl
 cp -R /tmp/zcl/plugins/zcode-codex-leader/. "$ZCACHE"/
@@ -62,7 +62,7 @@ rm -rf "$ZCACHE/.codex-plugin"
 node -e '
 const fs=require("fs"),p=process.env.HOME+"/.zcode/cli/plugins/marketplaces/zcode-plugins-official/marketplace.json";
 const d=JSON.parse(fs.readFileSync(p,"utf8"));
-const e={cachePath:process.env.HOME+"/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.1.0",name:"zcode-codex-leader",source:"filesystem",version:"0.1.0"};
+const e={cachePath:process.env.HOME+"/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.2.0",name:"zcode-codex-leader",source:"filesystem",version:"0.2.0"};
 d.plugins=[...d.plugins.filter(x=>x.name!=="zcode-codex-leader"),e];
 fs.writeFileSync(p,JSON.stringify(d,null,2));
 '
