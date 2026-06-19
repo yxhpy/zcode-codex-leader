@@ -5,6 +5,8 @@
 //   ask <prompt> [--image <path>] [--model <m>] [--output-schema <file>] [--effort <e>]
 //       Code generation / parsing. Optional local image, model, reasoning effort,
 //       and JSON-Schema-constrained structured output.
+//   ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+//       Like ask, but reads the prompt from a file and writes the full result to a file.
 //   vision <image-path> <question>
 //       Visual understanding of a local image.
 //   generate-image <prompt> [--out <path>]
@@ -91,6 +93,32 @@ async function cmdAsk(positional: string[], flags: Record<string, string>): Prom
   // print agent messages (the actual answer)
   for (const m of r.messages) process.stdout.write(m + "\n");
   process.stdout.write(`Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}\n`);
+}
+
+// ask-file: code generation / parsing with file-based prompt and result output
+async function cmdAskFile(positional: string[], flags: Record<string, string>): Promise<void> {
+  const promptFile = positional[0];
+  if (!promptFile || !existsSync(promptFile)) fail("ask-file requires an existing <prompt-file>");
+  const prompt = readFileSync(promptFile, "utf8").trim();
+  if (!prompt) fail("ask-file: prompt file is empty");
+  const input: any[] = [{ type: "text", text: prompt }];
+  if (flags.image) {
+    if (!existsSync(flags.image)) fail(`image not found: ${flags.image}`);
+    input.unshift({ type: "localImage", path: flags.image, detail: flags.detail || "auto" });
+  }
+  const opts: any = {};
+  if (flags.model) opts.model = flags.model;
+  if (flags.effort) opts.effort = flags.effort;
+  if (flags["output-schema"]) opts.outputSchema = readJsonFile(flags["output-schema"]);
+
+  const r = await runTurn(input, opts);
+  bumpDispatch();
+  const dir = pluginDataDir();
+  const outPath = flags.out || path.join(dir, `result-${Date.now()}.txt`);
+  const resultText = r.messages.length > 0 ? r.messages.join("\n") : "(no agentMessage text returned)";
+  writeFileSync(outPath, resultText, "utf8");
+  process.stdout.write(outPath + "\n");
+  process.stdout.write(`Plugin evidence: ask-file via codex_bridge.ts — turn ${r.turnId} → ${outPath}\n`);
 }
 
 // vision: visual understanding of a local image
@@ -214,6 +242,7 @@ async function main(): Promise<void> {
   const { sub, positional, flags } = parseArgs(process.argv.slice(2));
   switch (sub) {
     case "ask":            return cmdAsk(positional, flags);
+    case "ask-file":       return cmdAskFile(positional, flags);
     case "vision":         return cmdVision(positional, flags);
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
@@ -233,6 +262,8 @@ const USAGE = `codex_bridge — ZCode's leader-only dispatch channel to the resi
 
 Usage:
   codex_bridge ask <prompt> [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+  codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+      Like ask, but reads the prompt from a file and writes the full result to a file. stdout shows only the result path + evidence. Saves leader context tokens.
   codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
   codex_bridge generate-image <prompt> [--out <path>]
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
