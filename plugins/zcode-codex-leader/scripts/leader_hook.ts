@@ -10,7 +10,7 @@
 
 import { readFileSync } from "node:fs";
 import { constitution } from "./constitution.ts";
-import { ensureServer, readSession, stopServer } from "./app_server_pool.ts";
+import { readSession, stopServer } from "./app_server_pool.ts";
 
 // Read the full stdin as a JSON object. Hooks receive a single JSON payload.
 function readStdinJson(): any {
@@ -39,21 +39,16 @@ function block(reason: string): never {
 }
 
 // --- session-start ---------------------------------------------------------
-async function onSessionStart(): Promise<void> {
+function onSessionStart(): void {
   const input = readStdinJson();
-  const cwd: string = input.cwd || process.cwd();
-  const pluginRoot = process.env.PLUGIN_ROOT || process.cwd();
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.env.PLUGIN_ROOT || process.cwd();
 
-  // Inject the constitution into context.
+  // Inject the constitution into context. That is the ONLY job of this hook —
+  // it must return fast (zcode/codex wait on it). The resident worker is NOT
+  // started here; codex_bridge.ts starts it lazily on the first dispatch.
+  // (Starting it here previously caused hook timeouts: the worker spawn +
+  // WebSocket probe kept the event loop alive past the hook's timeout.)
   emitContext(constitution(pluginRoot));
-
-  // Best-effort: ensure the resident worker is up so the first dispatch is fast.
-  // Failure here is non-fatal — codex_bridge.ts lazily starts the worker too.
-  try {
-    await ensureServer();
-  } catch (e: any) {
-    process.stderr.write(`[zcode-codex-leader] worker not started at session start (${e?.message || e}); will start lazily on first dispatch.\n`);
-  }
   process.exit(0);
 }
 
