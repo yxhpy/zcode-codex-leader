@@ -11,6 +11,9 @@
 //       Image generation via the worker's image_generation_call capability.
 //   mcp-tool <server> <tool> [--args <json>] [--thread]
 //       Direct MCP tool call (bypasses a turn).
+//   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
+//       Dispatch a task to the local Antigravity CLI (agy) — long-context,
+//       multimodal, live web.
 //
 // Each successful call bumps the session dispatch count and prints a trailing
 // "Plugin evidence:" line so ZCode can aggregate evidence for the Stop gate.
@@ -18,6 +21,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
 import { runTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
 
 function fail(msg: string, code = 1): never {
@@ -47,6 +51,25 @@ function readJsonFile(p: string): any {
   if (!existsSync(p)) fail(`file not found: ${p}`);
   try { return JSON.parse(readFileSync(p, "utf8")); }
   catch { fail(`invalid JSON in ${p}`); }
+}
+
+function resolveAgyBin(): string {
+  const candidate = process.env.AGY_BIN || path.join(os.homedir(), ".local/bin/agy");
+  return existsSync(candidate) ? candidate : "agy";
+}
+
+function parseAgyTimeoutMs(value: string): number {
+  const m = value.trim().match(/^(\d+)(ms|s|m|h)?$/i);
+  if (!m) return 20 * 60 * 1000;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return 20 * 60 * 1000;
+  switch ((m[2] || "ms").toLowerCase()) {
+    case "h": return n * 60 * 60 * 1000;
+    case "m": return n * 60 * 1000;
+    case "s": return n * 1000;
+    case "ms": return n;
+    default: return 20 * 60 * 1000;
+  }
 }
 
 // ask: code generation / parsing, optionally with image + structured output schema
@@ -136,6 +159,57 @@ async function cmdMcpTool(positional: string[], flags: Record<string, string>): 
   process.stdout.write(`Plugin evidence: mcp-tool via codex_bridge.ts — ${server}/${tool}\n`);
 }
 
+// agy: dispatch to local Antigravity CLI
+async function cmdAgy(positional: string[], flags: Record<string, string>): Promise<void> {
+  const prompt = positional.join(" ").trim();
+  if (!prompt) fail("agy requires a prompt");
+  const printTimeout = flags.timeout || "20m";
+  const argv = ["--print", prompt, "--print-timeout", printTimeout];
+  if (flags.model) argv.push("--model", flags.model);
+  if (flags["add-dir"]) {
+    for (const dir of flags["add-dir"].split(",").map((s) => s.trim()).filter(Boolean)) {
+      argv.push("--add-dir", dir);
+    }
+  }
+
+  const child = spawn(resolveAgyBin(), argv, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+    cwd: process.cwd(),
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+  child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const hardTimeoutMs = parseAgyTimeoutMs(printTimeout) + 10000;
+  const code = await new Promise<number | null>((resolve) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+    }, hardTimeoutMs);
+    child.on("close", (closeCode) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      resolve(closeCode);
+    });
+    child.on("error", (e) => fail(`failed to start agy: ${e.message}`));
+  });
+
+  if (timedOut) fail(`agy timed out after ${hardTimeoutMs}ms`);
+  if (code !== 0) {
+    process.stderr.write(Buffer.concat(stderr).toString());
+    fail(`agy exited with code ${code}`);
+  }
+
+  process.stdout.write(Buffer.concat(stdout));
+  process.stdout.write("Plugin evidence: agy via codex_bridge.ts — exit 0\n");
+  bumpDispatch();
+}
+
 async function main(): Promise<void> {
   const { sub, positional, flags } = parseArgs(process.argv.slice(2));
   switch (sub) {
@@ -143,6 +217,7 @@ async function main(): Promise<void> {
     case "vision":         return cmdVision(positional, flags);
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
+    case "agy":            return cmdAgy(positional, flags);
     case "help":
     case "--help":
     case "-h":
@@ -161,6 +236,8 @@ Usage:
   codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
   codex_bridge generate-image <prompt> [--out <path>]
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
+  codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
+      Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
   codex_bridge help
 
 Each command prints a trailing "Plugin evidence:" line for the Stop gate.

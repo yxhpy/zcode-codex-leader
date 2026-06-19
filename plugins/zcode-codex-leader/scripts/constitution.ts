@@ -56,6 +56,8 @@ Commands:
       Image generation. Prints the saved PNG path.
   mcp-tool <server> <tool> [--args <json>] [--thread true]
       Direct MCP tool call without a full turn.
+  agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
+      Dispatch to local Antigravity CLI (agy) for long-context / multimodal / live-web work.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
