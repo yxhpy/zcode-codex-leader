@@ -89,17 +89,29 @@ async function isAlive(s: SessionState): Promise<boolean> {
 //
 // The worker is deliberately stripped to its core capability set: shell, file
 // read/write/edit, and search. All Codex plugins, MCP servers, memories,
-// multi-agent spawning, plugin hooks, and goals are disabled via -c config
-// overrides so the worker cannot invoke external tools (browser, computer-use,
-// cloudflare, etc.) that would slow it down or pollute its output.
+// multi-agent spawning, plugin hooks, goals, built-in apps, browser/computer-use,
+// image generation, and tool suggestions are disabled via -c config overrides so
+// the worker cannot invoke external tools (browser, computer-use, cloudflare,
+// codex apps, node_repl, etc.) that would slow it down or pollute its output.
 async function startWorker(): Promise<SessionState> {
   const bin = codexBinary();
   const workerArgs = [
     "app-server", "--listen", "ws://127.0.0.1:0",
     // --- Disable all plugins (browser, chrome, computer-use, cloudflare, documents, etc.)
     "-c", "features.plugins=false",
-    // --- Disable MCP servers (node_repl / browser backends)
+    // --- Disable MCP servers; node_repl must be explicitly disabled because
+    // --- Codex merges mcp_servers overrides instead of replacing the table.
     "-c", "mcp_servers={}",
+    "-c", "mcp_servers.node_repl.enabled=false",
+    // --- Disable built-in app/browser/computer-use surfaces that can expose extra MCP tools
+    "-c", "features.apps=false",
+    "-c", "features.browser_use=false",
+    "-c", "features.browser_use_external=false",
+    "-c", "features.computer_use=false",
+    "-c", "features.in_app_browser=false",
+    "-c", "features.image_generation=false",
+    "-c", "features.skill_mcp_dependency_install=false",
+    "-c", "features.tool_suggest=false",
     // --- Disable memories (avoids stale context injection)
     "-c", "features.memories=false",
     // --- Disable multi-agent spawning (worker must not spawn sub-agents)
