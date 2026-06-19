@@ -41,37 +41,48 @@ codex plugin add zcode-codex-leader@zcode-codex-leader
 
 ### Install on ZCode
 
-ZCode has no `marketplace add` command, so installation is a manual copy + register:
+ZCode 0.14.8 lists and loads plugins only from the `zcode-plugins-official` marketplace namespace — the `local` namespace is NOT shown by `zcode plugins list` and will not load. The installer manages the official namespace for you: it copies the plugin into the official cache, strips the Codex-only `.codex-plugin` manifest from the ZCode cache copy, registers a `source: "filesystem"` marketplace entry, enables `zcode-codex-leader@zcode-plugins-official`, and removes any stale copy of this plugin from the `local` namespace.
 
 ```bash
-# 1. Clone the plugin into ZCode's plugin cache
-ZCACHE="$HOME/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.4.0"
-mkdir -p "$ZCACHE"
 git clone https://github.com/yxhpy/zcode-codex-leader /tmp/zcl
-cp -R /tmp/zcl/plugins/zcode-codex-leader/. "$ZCACHE"/
-
-# 2. Strip the Codex-only manifest. ZCode reads both .zcode-plugin and
-#    .codex-plugin, and the .zcode-plugin manifest intentionally omits the
-#    "hooks" field (ZCode auto-scans hooks/hooks.json; declaring it would
-#    trigger "Duplicate plugin hooks file ignored"). Removing .codex-plugin
-#    avoids any cross-product confusion. Codex install uses .codex-plugin
-#    and is unaffected since this copy is ZCode-only.
-rm -rf "$ZCACHE/.codex-plugin"
-
-# 3. Register it in the official marketplace manifest
-node -e '
-const fs=require("fs"),p=process.env.HOME+"/.zcode/cli/plugins/marketplaces/zcode-plugins-official/marketplace.json";
-const d=JSON.parse(fs.readFileSync(p,"utf8"));
-const e={cachePath:process.env.HOME+"/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.4.0",name:"zcode-codex-leader",source:"filesystem",version:"0.4.0"};
-d.plugins=[...d.plugins.filter(x=>x.name!=="zcode-codex-leader"),e];
-fs.writeFileSync(p,JSON.stringify(d,null,2));
-'
-
-# 4. Enable it
-zcode plugins enable zcode-codex-leader
-# (if `zcode` is not on PATH, invoke the CLI directly:
-#  node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs plugins enable zcode-codex-leader)
+cd /tmp/zcl
+node scripts/install-zcode.mjs
 ```
+
+Restart ZCode (or start a new session) so the hooks take effect.
+
+### Upgrading
+
+**ZCode** — pull the new release and re-run the installer. It is idempotent and safe to re-run: it removes older cache version directories for this plugin (keeping only the new version), updates the marketplace entry to point at the new version's cache path, and re-enables the plugin.
+
+```bash
+cd /tmp/zcl                 # your clone of this repo
+git pull
+node scripts/install-zcode.mjs
+```
+
+Then restart ZCode.
+
+> Do **not** manually copy the plugin into a new version-numbered directory. Manual copy-based upgrades leave stale sibling directories (e.g. an old `0.3.0/` next to the new `0.4.0/`), and ZCode reports `plugin_duplicate_id` when the same plugin id appears in more than one cache directory. The installer cleans those up for you.
+
+**Codex** — refresh the marketplace snapshot, then re-add the plugin:
+
+```bash
+codex plugin marketplace upgrade zcode-codex-leader
+codex plugin add zcode-codex-leader@zcode-codex-leader
+```
+
+### Troubleshooting: duplicate plugin id
+
+`plugin_duplicate_id · zcode-codex-leader@zcode-plugins-official` means ZCode found the same plugin id in more than one cache directory — typically an old version directory left behind by a manual copy-based upgrade. Fix it by re-running the installer, which removes all older version directories for this plugin:
+
+```bash
+cd /tmp/zcl
+git pull
+node scripts/install-zcode.mjs
+```
+
+If you previously installed into the `local` namespace (which ZCode 0.14.8 does not load), the installer removes that legacy copy automatically. Pass `--keep-local` only if you intentionally want to preserve it.
 
 After install, the next Codex/ZCode session automatically:
 1. Injects the leader constitution into context (`SessionStart`).
