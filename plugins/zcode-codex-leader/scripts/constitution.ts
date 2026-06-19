@@ -61,6 +61,10 @@ Commands:
   gpt-pro ask <prompt> [--out <file>] [--timeout <sec>]
       Dispatch a hard code review or deep question to ChatGPT web (Pro model) via
       the opencli Browser Bridge. gpt-pro status checks Bridge / login / Pro tier.
+      Default --timeout is 900s; if the Pro model is still actively generating
+      when the timeout hits, the deadline auto-extends (up to +30min) so a slow
+      deep-reasoning reply is not cut off. Partial responses are saved to --out
+      rather than discarded.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.

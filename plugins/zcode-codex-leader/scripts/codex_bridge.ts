@@ -306,7 +306,7 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const timeoutForHardLimit = flags.timeout && /^\d+$/.test(flags.timeout) ? `${flags.timeout}s` : flags.timeout;
-  const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLimit) : 300000) + 30000;
+  const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLimit) : 900000) + 60000;
   const code = await new Promise<number | null>((resolve) => {
     const timer = setTimeout(() => {
       timedOut = true;

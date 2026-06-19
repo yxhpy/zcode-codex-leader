@@ -14,6 +14,7 @@ type RunResult = {
 const FALLBACK_OPENCLI = "/opt/homebrew/bin/opencli";
 const MAX_FILE_BYTES = 200 * 1024;
 const CHATGPT_URL = "https://chatgpt.com";
+const MAX_AUTO_EXTEND_MS = 1800000; // hard ceiling for dynamic deadline extension (30 min beyond initial timeout)
 const ASSISTANT_COUNT_JS = "(()=>document.querySelectorAll('[data-message-author-role=assistant]').length)()";
 const EXTRACT_NEW_ASSISTANT_JS =
   "(()=>{const m=[...document.querySelectorAll('[data-message-author-role=assistant]')];const count=m.length;return JSON.stringify({count,text:count?m[count-1].innerText:''});})()";
@@ -216,7 +217,7 @@ function parseAskArgs(args: string[]): { prompt: string; files: string[]; out?: 
   let promptFile: string | undefined;
   const files: string[] = [];
   let out: string | undefined;
-  let timeoutSec = 300;
+  let timeoutSec = 900;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -504,7 +505,8 @@ function askCommand(args: string[]): number {
     return 2;
   }
 
-  const deadline = Date.now() + parsed.timeoutSec * 1000;
+  let deadline = Date.now() + parsed.timeoutSec * 1000;
+  const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
   try {
     const doctor = runOpencliWithinDeadline(["doctor"], deadline);
     if (!isBridgeConnected(doctor)) {
@@ -579,10 +581,14 @@ function askCommand(args: string[]): number {
       }
     }
 
-    while (Date.now() < deadline) {
+    while (Date.now() < absoluteCeiling) {
       const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
       if (!commandFailed(generating) && generating.stdout.trim() === "true") {
         sawGenerating = true;
+        if (Date.now() >= deadline && Date.now() < absoluteCeiling) {
+          deadline = Math.min(absoluteCeiling, deadline + 120000);
+          log(`extending deadline (still generating): +120s, new total budget ${Math.round((deadline - sentAt) / 1000)}s`);
+        }
         const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
         if (commandFailed(waited)) {
           log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
@@ -618,13 +624,22 @@ function askCommand(args: string[]): number {
         if (commandFailed(waited)) {
           log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
         }
+      } else if (Date.now() < absoluteCeiling) {
+        // Past the initial deadline but within the auto-extend window: avoid a
+        // tight spin while waiting for the next generating/stable check.
+        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], absoluteCeiling);
+        if (commandFailed(waited)) {
+          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+        }
       }
     }
 
     log("timed out waiting for assistant response to stabilize.");
     if (currentText || lastText) {
-      log("last collected assistant text:");
-      log(currentText || lastText);
+      const partial = currentText || lastText;
+      log("timed out but saving partial assistant response");
+      writeAssistantOutput(partial, parsed.out);
+      return 0;
     }
     return 2;
   } catch (error) {
