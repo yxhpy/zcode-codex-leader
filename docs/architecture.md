@@ -23,11 +23,13 @@ Make ZCode/Codex a pure **leader/owner** that never does substantive implementat
               │                                                 │
    ┌──────────┴──────────┐                          ┌────────────┴──────────┐
    │ leader_hook.ts      │                          │ codex_bridge.ts       │
-   │ (4 hook events)     │                          │ (4 dispatch commands) │
+   │ (4 hook events)     │                          │ (6 dispatch commands) │
    ├─────────────────────┤                          ├───────────────────────┤
    │ session-start:      │                          │ ask                   │
    │  inject constitution│                          │ vision                │
    │  + ensureServer     │                          │ generate-image        │
+   │ watchdog:           │                          │ test                  │
+   │  keep worker alive  │                          │ ask-file              │
    │ pre-tool-use:       │                          │ mcp-tool              │
    │  block writes,      │                          │ (each bumps           │
    │  allow reads+bridge │                          │  dispatchCount,       │
@@ -76,6 +78,39 @@ Environment: `${PLUGIN_ROOT}` (and `${CLAUDE_PLUGIN_ROOT}` alias) is the install
 ## Session state
 
 `session.json` (in `PLUGIN_DATA`) holds: `pid`, `wsUrl`, `healthUrl`, `startedAt`, `dispatchCount`. Threads are **per-dispatch ephemeral** (not reused across calls) — reusing a long-lived thread was observed to leave turns without a `turn/completed` notification. ZCode (the leader) holds cross-packet context itself, so per-dispatch threads match the bounded-packet model.
+
+## Model tier routing (0.5.0)
+
+The bridge picks a model per dispatch instead of one-model-fits-all. Tiers are defined in `MODEL_TIERS` in app_server_pool.ts:
+
+| Tier | Model | Effort | service_tier | Use for |
+|------|-------|--------|--------------|---------|
+| fast | gpt-5.4-mini | low | fast | parsing, explorer, Q&A, summaries |
+| balanced (default) | gpt-5.5 | medium | default | regular codegen |
+| strong | gpt-5.5 | high | default | review, debug, complex refactor |
+
+Selection priority: explicit `--model`/`--effort` > `--tier` > `--task-kind` inference > balanced. This mirrors codex's native subagent conventions (e.g. `~/.codex/agents/explorer.toml` uses gpt-5.4-mini/fast while `code-reviewer.toml` uses gpt-5.5/high).
+
+## Watchdog and resilience (0.5.0)
+
+Three reliability improvements over 0.4.x:
+
+1. **Thread reuse**: the resident worker now keeps ONE non-ephemeral thread across dispatches (cached in session.json.threadId), eliminating per-dispatch thread/start cold start. Self-heals if codex reports the thread missing. Set `FORCE_EPHEMERAL_THREAD=1` to revert to the old ephemeral behavior.
+
+2. **Wedge watchdog**: replaces the 50ms spin loop with tiered timeouts:
+   - 250ms poll interval (was 50ms - less CPU spin)
+   - 90s post-tool quiet timeout (if a tool completes and codex goes silent for 90s, issue turn/interrupt and retire the thread)
+   - 300s hard turn ceiling (unchanged)
+   - subprocess liveness check each iteration (dead worker -> immediate partial return)
+
+3. **OAuth failure classification**: JSON-RPC errors and stderr are scanned for token-refresh failure patterns (invalid_grant, refresh token, token has expired, 401 unauthorized, etc.). On match, the user gets a clear "Run `codex login`" hint instead of a raw RPC error. Mirrors hermes-agent's `_classify_oauth_failure`.
+
+## Gate improvements (0.5.0)
+
+The PreToolUse Bash gate was too strict (blocked `codex --version`, `readlink`, `file`, `test`). Now:
+- **Expanded allowlist**: read-only inspection commands (version queries for node/python/go/rustc/swift/make/docker/codex, readlink, file, test, uname, git config --get, npm ls/view, etc.) are allowed directly.
+- **Dangerous-op blacklist**: a backstop regex catches write/destructive ops (rm -rf, git commit/push/merge, npm install, curl -X POST, chmod, sudo, kill -9, etc.) even if they start with an allowlisted word. Checked BEFORE the allowlist.
+- Order: bridge path -> dangerous blacklist -> readonly allowlist -> block.
 
 ## Failure modes
 

@@ -68,7 +68,8 @@ const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "s
 // directly (context gathering, verification). Anything else in Bash must go
 // through codex_bridge.ts. Tolerates absolute-path forms (/bin/cat, /usr/bin/grep)
 // and leading env-var assignments (FOO=bar ls ...).
-const READONLY_BASH = /^(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:\/(?:usr\/)?bin\/)?(?:ls|cat|head|tail|pwd|echo|which|file|stat|wc|grep|rg|find|fd|git\s+(?:status|log|diff|show|branch|blame|remote|rev-parse|ls-files)|node\s+--version|npm\s+(?:ls|view|outdated)|go\s+(?:version|list)|cargo\s+(?:tree|metadata)|python3?\s+--version)\b/;
+const READONLY_BASH = /^(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:\/(?:usr\/)?bin\/)?(?:(?:ls|cat|head|tail|pwd|echo|which|file|stat|wc|grep|rg|find|fd|tree|du|df|diff|cmp|sort|uniq|cut|tr|basename|dirname|readlink|realpath|uname|env|printenv|whoami|id|hostname|date|uptime|test|\[)(?:\s+.*)?|(?:node|python3?|python|ruby|go|rustc|swift)\s+--version\b|(?:xcodebuild)\s+-version\b|(?:make)\s+(?:-n|-p|--dry-run|--print-data-base)\b|(?:docker)\s+(?:ps|version|inspect\s+--format|images)\b|(?:gh)\s+--version\b|(?:java)\s+-version\b|(?:mvn|gradle|dotnet)\b|(?:git)\s+(?:status|log|diff|show|branch|blame|remote|rev-parse|ls-files|ls-remote|describe|tag|stash\s+list|reflog)(?:\s+.*)?|(?:git)\s+config\s+--get\b|(?:npm)\s+(?:ls|view|outdated|info)\b|(?:yarn)\s+info\b|(?:pnpm)\s+list\b|(?:cargo)\s+(?:tree|metadata)\b|(?:go)\s+(?:version|list|env)\b|(?:codex)\s+(?:--version|--help|help|-h)\b)/;
+const DANGEROUS_BASH = /(?:^|\s)(?:rm\s+-?\w*r|rm\s+-rf|rm\s+-fr|rmdir|mv\s+\S+\s*>|cp\s+.*>|tee\s+\S*\/|>\s*\/|>>|git\s+(?:commit|push|merge|rebase|reset|checkout|clean|stash\s+(?:drop|pop)|cherry-pick)|npm\s+(?:install|i|publish|uninstall)|yarn\s+(?:add|remove|publish)|pnpm\s+(?:add|remove|publish)|pip\s+install|pip3\s+install|cargo\s+install|brew\s+(?:install|uninstall|upgrade)|curl\s+.*-X\s*(?:POST|PUT|DELETE|PATCH)|curl\s+.*--data|wget\s+.*-O|chmod|chown|sudo|kill\s+-9|kill\s+-KILL|pkill|killall|launchctl\s+(?:load|unload|bootstrap)|defaults\s+write|mkfs|dd\s+.*of=|shutdown|reboot)\b/;
 
 function onPreToolUse(): void {
   const input = readStdinJson();
@@ -105,12 +106,16 @@ function onPreToolUse(): void {
     if (cmd.includes(bridgePath) || cmd.includes("codex_bridge.ts")) {
       process.exit(0);
     }
+    const trimmed = cmd.trim();
+    if (DANGEROUS_BASH.test(trimmed)) {
+      block(`[Leader Gate] Write/destructive Bash is blocked: \`${cmd}\`. This mutates the system. Dispatch via codex_bridge.ts (ask for code changes, test for running tests). Reason: leader-only mode.`);
+    }
     // Allow read-only context/verification commands.
-    if (READONLY_BASH.test(cmd.trim())) {
+    if (READONLY_BASH.test(trimmed)) {
       process.exit(0);
     }
     // Everything else (rm, mv, cp, npm install, git commit, curl writes, etc.): block.
-    block(`[Leader Gate] Bash write/exec is blocked: \`${cmd.slice(0, 120)}\`. ZCode must not run implementation commands directly. Dispatch via: node --experimental-strip-types "${bridgePath}" <ask|vision|generate-image|mcp-tool> ...  Reason: leader-only mode.`);
+    block(`[Leader Gate] Bash command not recognized as read-only: \`${cmd}\`. If it is a read-only inspection command, the allowlist may need extending. For implementation/test work, dispatch via codex_bridge.ts. Reason: leader-only mode.`);
   }
 
   // 4) Unknown tool: default allow (avoid breaking the harness). The constitution

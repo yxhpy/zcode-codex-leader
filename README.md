@@ -19,9 +19,23 @@ Calling `codex` as a CLI per task is slow (tens of seconds of cold start each ti
 | Code grounded in an image | `ask <prompt> --image <path>` | `turn/start` with `localImage` + text input |
 | Visual understanding | `vision <image-path> <question>` | `turn/start` with `localImage` (detail: high) + question |
 | Image generation | `generate-image <prompt> [--out <path>]` | `turn/start`; captures `imageGeneration` item, saves base64 PNG |
+| Test execution (sandboxed) | `test <prompt> [-- <cmd>] [--browser]` | One-shot worker with workspace-write sandbox (+optional browser); runs tests in isolation |
 | MCP tool direct call | `mcp-tool <server> <tool> [--args <json>]` | `mcpServer/tool/call` (bypasses a turn) |
 
 Measured on a MacBook (gpt-5.5): handshake 17ms, code turn ~11s, vision ~11s, image generation ~21s, producing a real 1254×1254 PNG.
+Resilience (0.5.0): resident thread reuse (no per-dispatch cold start), wedge watchdog (90s post-tool quiet -> interrupt, vs old 5min blind wait), OAuth failure classification.
+
+## Model tier routing (0.5.0)
+
+The bridge routes each dispatch to the right model instead of one-model-fits-all:
+
+| Tier | Model | Effort | Use for |
+|------|-------|--------|----------|
+| `fast` | gpt-5.4-mini | low | Parsing, explorer, simple Q&A, summaries |
+| `balanced` (default) | gpt-5.5 | medium | Regular codegen |
+| `strong` | gpt-5.5 | high | Code review, debugging, complex refactor |
+
+Pass `--tier` to force, `--task-kind` to infer, or `--model`/`--effort` for full manual control. This aligns with codex native subagent conventions.
 
 ## Install
 

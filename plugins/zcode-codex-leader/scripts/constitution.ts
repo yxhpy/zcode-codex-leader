@@ -51,9 +51,13 @@ image, or generate an image is:
   node --experimental-strip-types "${bridge}" <command> ...
 
 Commands:
-  ask <prompt> [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+  ask <prompt> [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
       Code generation / parsing. Add --image to ground the answer in a local image.
       Use --output-schema (a JSON Schema file) to force structured/parseable output.
+      --tier selects a model preset (fast=gpt-5.4-mini/low, balanced=gpt-5.5/medium default,
+      strong=gpt-5.5/high). --task-kind auto-infers the tier from the task type
+      (codegen/review/debug/refactor->strong, explore/parse/qa/summary->fast, else->balanced).
+      Explicit --model/--effort always override the tier preset.
   vision <image-path> <question>
       Visual understanding of a local image (what does it show?).
   generate-image <prompt> [--out <path>] [--timeout <sec>]
@@ -61,6 +65,12 @@ Commands:
       with image generation enabled, waits for the final imageGeneration item,
       writes the PNG, and prints the saved PNG path. The resident codex worker
       still keeps image generation disabled.
+  test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]
+      Run a test suite in an isolated one-shot worker with sandbox enabled
+      (workspace-write by default, danger-full-access with --browser). Use --browser
+      to enable browser_use + chrome plugin for e2e tests. Default timeout 600s.
+      Output >800 chars is written to a file; stdout shows the path + summary.
+      The resident worker stays clean - test runs in a separate ephemeral worker.
   mcp-tool <server> <tool> [--args <json>] [--thread true]
       Direct MCP tool call without a full turn.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
@@ -140,6 +150,15 @@ substantive implementation / code parsing -> codex (ask / ask-file); long-contex
 / multimodal / live-web research -> agy; hardest code review / deep research on
 the strongest Pro model -> gpt-pro.
 
+### Model tier routing (0.5.0)
+ZCode picks the right model per dispatch instead of one-model-fits-all:
+- fast (gpt-5.4-mini, effort low, service_tier fast): parsing, explorer, simple Q&A, summaries
+- balanced (gpt-5.5, effort medium): regular codegen (default)
+- strong (gpt-5.5, effort high): review, debug, complex refactor
+Pass --tier to force a tier, --task-kind to let the bridge infer it, or --model/--effort
+for full manual control. This aligns with codex native subagent conventions
+(see ~/.codex/agents/ explorer vs code-reviewer).
+
 ### Worker Boundary (HARD — no cross-capability calls)
 
 Capabilities are PEER-LEVEL and ISOLATED. A worker MUST NOT invoke another
@@ -164,6 +183,9 @@ only use <shell + edit on the named files>. Do NOT run opencli, agy,
 codex_bridge.ts, or any browser automation — those are a different worker's
 lane.' ZCode must not ASSIGN out-of-lane work either: do not ask codex to drive
 opencli, do not ask gpt-pro to edit repo files.
+The test subcommand is the exception: it spawns a one-shot worker with sandbox +
+optional browser enabled, runs the test, then tears it down - it never touches
+the resident worker.
 
 ### Output Discipline (HARD — protect leader context)
 

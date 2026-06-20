@@ -30,13 +30,32 @@ node --experimental-strip-types "${PLUGIN_ROOT}/scripts/codex_bridge.ts" <comman
 | Command | Use for | Example |
 |---------|---------|---------|
 | `ask <prompt>` | Code generation / parsing / Q&A | `codex_bridge.ts ask "write a merge sort in Python"` |
-| `ask <prompt> --image <path>` | Code grounded in an image | `codex_bridge.ts ask "what's wrong with this code?" --image ./screenshot.png` |
+| `ask <prompt> --image <path>` | Code grounded in an image | `codex_bridge.ts ask "what's wrong?" --image ./screenshot.png` |
 | `ask <prompt> --output-schema schema.json` | Structured/parseable output | constrain the worker to a JSON Schema |
+| `ask <prompt> --tier strong` | Force a model tier | `codex_bridge.ts ask "review this patch" --tier strong` |
 | `vision <image-path> <question>` | Describe/understand a local image | `codex_bridge.ts vision ./diagram.png "explain this architecture"` |
 | `generate-image <prompt> [--out <path>]` | Generate an image | `codex_bridge.ts generate-image "pixel-art mushroom"` |
+| `test <prompt> [-- <cmd>] [--browser]` | Run tests in an isolated sandboxed worker | `codex_bridge.ts test "run pytest" -- pytest -x` |
 | `mcp-tool <server> <tool> [--args <json>]` | Direct MCP tool call | `codex_bridge.ts mcp-tool filesystem read_file --args '{"path":"x"}'` |
 
 Each command prints the worker's result, then a trailing `Plugin evidence:` line.
+
+## Model tier routing (pick the right model per dispatch)
+
+Instead of one model for everything, the bridge routes by task:
+
+| Tier | Model | Effort | Use when |
+|------|-------|--------|----------|
+| `fast` | gpt-5.4-mini | low | Parsing, explorer, simple Q&A, summaries, file reads |
+| `balanced` (default) | gpt-5.5 | medium | Regular codegen, most ask dispatches |
+| `strong` | gpt-5.5 | high | Code review, debugging, complex refactor, architecture |
+
+How to select:
+- **Auto by task type**: pass `--task-kind codegen|review|debug|refactor|explore|parse|qa|summary` and the bridge infers the tier.
+- **Force a tier**: pass `--tier fast|balanced|strong`.
+- **Full manual**: pass `--model <name> --effort <level>` (overrides any tier).
+
+Rule of thumb: if the dispatch is "find/read/summarize" use fast; if it's "write/implement" use balanced; if it's "review/find subtle bugs/design" use strong. Misusing strong for trivial work wastes latency; misusing fast for hard review misses defects.
 
 ## How to run a task (the dispatch loop)
 

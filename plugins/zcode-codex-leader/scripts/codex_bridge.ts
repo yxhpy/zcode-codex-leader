@@ -2,15 +2,17 @@
 // codex_bridge.ts — ZCode's only legal channel for doing implementation work.
 //
 // Subcommands:
-//   ask <prompt> [--image <path>] [--model <m>] [--output-schema <file>] [--effort <e>]
+//   ask <prompt> [--image <path>] [--model <m>] [--output-schema <file>] [--effort <e>] [--tier <fast|balanced|strong>] [--task-kind <type>]
 //       Code generation / parsing. Optional local image, model, reasoning effort,
 //       and JSON-Schema-constrained structured output.
-//   ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+//   ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
 //       Like ask, but reads the prompt from a file and writes the full result to a file.
 //   vision <image-path> <question>
 //       Visual understanding of a local image.
 //   generate-image <prompt> [--out <path>] [--timeout <sec>]
 //       Synchronous image generation via a dedicated one-shot image worker.
+//   test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]
+//       Run a test suite in an isolated one-shot worker with sandbox (+optional browser).
 //   mcp-tool <server> <tool> [--args <json>] [--thread]
 //       Direct MCP tool call (bypasses a turn).
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
@@ -29,7 +31,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { runTurn, runImageTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
+import { runTurn, runImageTurn, runTestTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
 
 function fail(msg: string, code = 1): never {
   process.stderr.write(`codex_bridge: ${msg}\n`);
@@ -113,13 +115,15 @@ async function cmdAsk(positional: string[], flags: Record<string, string>): Prom
   const opts: any = {};
   if (flags.model) opts.model = flags.model;
   if (flags.effort) opts.effort = flags.effort;
+  if (flags.tier) opts.tier = flags.tier;
+  if (flags["task-kind"]) opts.taskKind = flags["task-kind"];
   if (flags["output-schema"]) opts.outputSchema = readJsonFile(flags["output-schema"]);
 
   const r = await runTurn(input, opts);
   bumpDispatch();
   // print agent messages (the actual answer)
   for (const m of r.messages) process.stdout.write(m + "\n");
-  process.stdout.write(`Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}\n`);
+  process.stdout.write(`Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""}\n`);
 }
 
 // ask-file: code generation / parsing with file-based prompt and result output
@@ -136,6 +140,8 @@ async function cmdAskFile(positional: string[], flags: Record<string, string>): 
   const opts: any = {};
   if (flags.model) opts.model = flags.model;
   if (flags.effort) opts.effort = flags.effort;
+  if (flags.tier) opts.tier = flags.tier;
+  if (flags["task-kind"]) opts.taskKind = flags["task-kind"];
   if (flags["output-schema"]) opts.outputSchema = readJsonFile(flags["output-schema"]);
 
   const r = await runTurn(input, opts);
@@ -145,7 +151,7 @@ async function cmdAskFile(positional: string[], flags: Record<string, string>): 
   const resultText = r.messages.length > 0 ? r.messages.join("\n") : "(no agentMessage text returned)";
   writeFileSync(outPath, resultText, "utf8");
   process.stdout.write(outPath + "\n");
-  process.stdout.write(`Plugin evidence: ask-file via codex_bridge.ts — turn ${r.turnId} → ${outPath}\n`);
+  process.stdout.write(`Plugin evidence: ask-file via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""} → ${outPath}\n`);
 }
 
 // vision: visual understanding of a local image
@@ -201,6 +207,46 @@ async function cmdGenerateImage(positional: string[], flags: Record<string, stri
   }
   process.stdout.write(outPath + "\n");
   process.stdout.write(`Plugin evidence: generate-image via codex_bridge.ts — turn ${r.turnId} → ${outPath}\n`);
+}
+
+// test: one-shot test worker with sandbox and optional browser support
+async function cmdTest(positional: string[], flags: Record<string, string>): Promise<void> {
+  let prompt = positional.join(" ").trim();
+  if (!prompt) fail("test requires a prompt");
+
+  const rawArgs = rawArgsAfterSubcommand("test");
+  const separatorIndex = rawArgs.indexOf("--");
+  const testCmd = separatorIndex === -1 ? [] : rawArgs.slice(separatorIndex + 1);
+  if (testCmd.length > 0) {
+    prompt += `\n\nRun exactly this command and report its full output: ${testCmd.join(" ")}`;
+  }
+
+  const timeoutSec = flags.timeout ? Number(flags.timeout) : 600;
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) fail(`invalid --timeout: ${flags.timeout}`);
+  const opts: any = {
+    cwd: process.cwd(),
+    timeoutMs: Math.round(timeoutSec * 1000),
+    browser: flags.browser === "true",
+    fullAccess: flags["full-access"] === "true" || flags.browser === "true",
+    tier: flags.tier || "balanced",
+    taskKind: flags["task-kind"] || "qa",
+  };
+  const input = [{ type: "text", text: prompt }];
+
+  const r = await runTestTurn(input, opts);
+  bumpDispatch();
+
+  const messages = r.messages.join("\n");
+  if (messages.length > 800 || flags.out) {
+    const outPath = flags.out || path.join(pluginDataDir(), `test-result-${Date.now()}.txt`);
+    writeFileSync(outPath, messages || "(no agentMessage text returned)", "utf8");
+    const summary = messages.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
+    process.stdout.write(outPath + "\n");
+    process.stdout.write((summary || "(no agentMessage text returned)") + "\n");
+  } else {
+    process.stdout.write(messages + (messages ? "\n" : ""));
+  }
+  process.stdout.write(`Plugin evidence: test via codex_bridge.ts — turn ${r.turnId} [browser=${opts.browser ? "on" : "off"}]\n`);
 }
 
 // mcp-tool: direct MCP tool call (bypasses a turn)
@@ -352,6 +398,7 @@ async function main(): Promise<void> {
     case "ask-file":       return cmdAskFile(positional, flags);
     case "vision":         return cmdVision(positional, flags);
     case "generate-image": return cmdGenerateImage(positional, flags);
+    case "test":           return cmdTest(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
     case "agy":            return cmdAgy(positional, flags);
     case "gpt-pro":        return cmdGptPro(positional, flags);
@@ -369,11 +416,14 @@ async function main(): Promise<void> {
 const USAGE = `codex_bridge — ZCode's leader-only dispatch channel to the resident codex app-server worker.
 
 Usage:
-  codex_bridge ask <prompt> [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>]
-  codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
+  codex_bridge ask <prompt> [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
+  codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
       Like ask, but reads the prompt from a file and writes the full result to a file. stdout shows only the result path + evidence. Saves leader context tokens.
   codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
   codex_bridge generate-image <prompt> [--out <path>] [--timeout <sec>]
+  codex_bridge test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]
+      Run a test suite in an isolated one-shot worker with sandbox (+optional browser). Default timeout 600s.
+      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
   codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
