@@ -59,6 +59,11 @@ function onSessionStart(): void {
 const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "TodoWrite", "WebFetch", "Task", "Agent"]);
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "NotebookEditDeleteCells"]);
 
+// Image files that the Read tool renders visually to the model. Reading these
+// is visual understanding, which the leader must dispatch to codex_bridge.ts
+// vision — never ingest directly.
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff", "tif", "avif", "heic", "heif"]);
+
 // Bash commands that are effectively read-only and safe for the leader to run
 // directly (context gathering, verification). Anything else in Bash must go
 // through codex_bridge.ts. Tolerates absolute-path forms (/bin/cat, /usr/bin/grep)
@@ -71,7 +76,19 @@ function onPreToolUse(): void {
   const tool: string = input.tool_name || input.toolName || "";
   const toolInput: any = input.tool_input || input.toolInput || {};
 
-  // 1) Explicitly read-only tools: allow.
+  // 1) Read-only tools: allow, EXCEPT Read on image files. The Read tool renders
+  //    images visually into the leader's context, which is visual understanding
+  //    and must be dispatched to codex_bridge.ts vision — never ingested directly.
+  if (tool === "Read") {
+    const filePath: string = toolInput.file_path || toolInput.filePath || "";
+    const ext = filePath.toLowerCase().split(".").pop() || "";
+    if (IMAGE_EXTENSIONS.has(ext)) {
+      const pluginRoot = process.env.PLUGIN_ROOT || process.cwd();
+      const bridgePath = `${pluginRoot}/scripts/codex_bridge.ts`;
+      block(`[Leader Gate] Read of image file is blocked: \`${filePath}\`. ZCode must not ingest images directly — that is visual understanding, which is dispatched. Run: node --experimental-strip-types "${bridgePath}" vision "${filePath}" "<your question>". Reason: leader-only mode.`);
+    }
+    process.exit(0);
+  }
   if (READONLY_TOOLS.has(tool)) process.exit(0);
 
   // 2) Explicitly write tools: block.

@@ -18,7 +18,10 @@ implementation, visual, and image-generation work.
 1. Orchestrate first. You (ZCode) coordinate, track state, read artifacts, and make
    decisions. You must NOT do substantive code generation, code parsing, visual
    understanding, image generation, or review work yourself while the codex
-   app-server worker is available. Those are dispatched.
+   app-server worker is available. Those are dispatched. In particular, do NOT use
+   the Read tool on image files (PNG/JPG/GIF/WEBP/BMP/SVG/etc.) — the Read tool
+   renders images visually into your context, which is doing visual understanding
+   yourself. Dispatch image files to codex_bridge.ts vision instead.
 
 2. Keep one ZCode owner thread responsible for edits, integration, verification,
    commits, release decisions, and final claims. The codex app-server worker is a
@@ -40,9 +43,10 @@ implementation, visual, and image-generation work.
 ## The Only Legal Implementation Channel
 
 All substantive work flows through ONE script. A PreToolUse gate physically blocks
-Edit / Write / NotebookEdit and write-class Bash tools; reads, search, and planning
-stay allowed. The single permitted way to produce code, understand an image, or
-generate an image is:
+Edit / Write / NotebookEdit, write-class Bash tools, AND Read on image files
+(PNG/JPG/JPEG/GIF/WEBP/BMP/SVG/ICO/TIFF/AVIF/HEIC); reads of text and code, search,
+and planning stay allowed. The single permitted way to produce code, understand an
+image, or generate an image is:
 
   node --experimental-strip-types "${bridge}" <command> ...
 
