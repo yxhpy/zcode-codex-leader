@@ -142,7 +142,7 @@ config overrides. It retains only its core capability set: shell
 (read/write/grep/find), file edit, and search. It cannot invoke browser,
 computer-use, cloudflare, node_repl, codex_apps, image generation, or any other
 plugin/app-provided tool. Image generation is the one explicit exception, and it
-is NOT available to the resident worker: `generate-image` starts a separate
+is NOT available to the resident worker: \`generate-image\` starts a separate
 one-shot image worker, synchronously waits for the image result, then tears that
 worker down. This keeps the worker fast and its output clean — no plugin context
 bloat, no stray MCP tool calls. Enforcement is both config-level (the overrides
