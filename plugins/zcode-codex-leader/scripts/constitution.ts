@@ -69,6 +69,14 @@ Commands:
       deep-reasoning reply is not cut off. The full response is ALWAYS printed to
       stdout (never hidden behind --out); --out only saves an extra copy to disk.
       Partial responses are also printed to stdout rather than discarded.
+  gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
+      Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and
+      wait for the SAME reply instead of re-dispatching the prompt. ask is
+      refused while an unfinished task (generating/timed-out, within 2h) is on
+      record, to prevent re-dispatching the same prompt into a new conversation
+      (death-loop). Pass --force to ask to discard the unfinished task. Use
+      continue (not ask) when a prior gpt-pro dispatch timed out. The full
+      response is ALWAYS printed to stdout (same gpt-pro exception as ask).
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -142,7 +150,7 @@ config overrides. It retains only its core capability set: shell
 (read/write/grep/find), file edit, and search. It cannot invoke browser,
 computer-use, cloudflare, node_repl, codex_apps, image generation, or any other
 plugin/app-provided tool. Image generation is the one explicit exception, and it
-is NOT available to the resident worker: \`generate-image\` starts a separate
+is NOT available to the resident worker: 'generate-image' starts a separate
 one-shot image worker, synchronously waits for the image result, then tears that
 worker down. This keeps the worker fast and its output clean — no plugin context
 bloat, no stray MCP tool calls. Enforcement is both config-level (the overrides

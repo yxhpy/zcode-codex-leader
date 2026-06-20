@@ -1,8 +1,9 @@
 #!/usr/bin/env -S node --experimental-strip-types
 
 import { spawnSync } from "child_process";
-import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync } from "fs";
-import { basename, extname, isAbsolute, resolve } from "path";
+import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync, unlinkSync } from "node:fs";
+import path, { basename, extname, isAbsolute, resolve } from "node:path";
+import { pluginDataDir } from "./app_server_pool.ts";
 
 type RunResult = {
   stdout: string;
@@ -11,11 +12,39 @@ type RunResult = {
   error?: Error;
 };
 
+type GptProTask = {
+  conversationUrl: string;
+  conversationId: string;
+  prompt: string;
+  baselineCount: number;
+  sentAt: number;
+  status: "generating" | "timed-out" | "completed";
+  partialText?: string;
+};
+
+type AskArgs = {
+  prompt: string;
+  files: string[];
+  out?: string;
+  timeoutSec: number;
+  force?: boolean;
+  url?: string;
+};
+
+type WaitOutcome = {
+  status: "completed" | "timed-out";
+  text: string;
+  lastText: string;
+  finalDeadline: number;
+};
+
 const FALLBACK_OPENCLI = "/opt/homebrew/bin/opencli";
 const MAX_FILE_BYTES = 200 * 1024;
 const CHATGPT_URL = "https://chatgpt.com";
 const MAX_AUTO_EXTEND_MS = 1800000; // hard ceiling for dynamic deadline extension (30 min beyond initial timeout)
 const ASSISTANT_COUNT_JS = "(()=>document.querySelectorAll('[data-message-author-role=assistant]').length)()";
+const EXTRACT_CONVERSATION_URL_JS =
+  "(()=>{return JSON.stringify({url:location.href,pathname:location.pathname});})()";
 const EXTRACT_NEW_ASSISTANT_JS =
   "(()=>{const m=[...document.querySelectorAll('[data-message-author-role=assistant]')];const count=m.length;return JSON.stringify({count,text:count?m[count-1].innerText:''});})()";
 const IS_GENERATING_JS =
@@ -27,12 +56,40 @@ const PROMPT_SENT_JS =
 const CLEAR_COMPOSER_JS =
   "(()=>{const el=document.querySelector('#prompt-textarea');if(!el)return JSON.stringify({ok:false,error:'missing composer'});el.innerHTML='';el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));const textarea=document.querySelector('textarea[name=\"prompt-textarea\"]');if(textarea){textarea.value='';textarea.dispatchEvent(new Event('input',{bubbles:true}));}const input=document.querySelector('#upload-files');if(input){input.files=new DataTransfer().files;input.dispatchEvent(new Event('change',{bubbles:true}));}for(const b of [...document.querySelectorAll('[aria-label*=\"移除文件\"],[aria-label*=\"Remove file\"],[aria-label*=\"remove file\"]')]){b.click();}return JSON.stringify({ok:true});})()";
 
+function taskPath(): string {
+  return path.join(pluginDataDir(), "gpt-pro-task.json");
+}
+
+function readTask(): GptProTask | null {
+  try {
+    if (!existsSync(taskPath())) return null;
+    const t = JSON.parse(readFileSync(taskPath(), "utf8")) as GptProTask;
+    if (!t || !t.conversationUrl) return null;
+    return t;
+  } catch {
+    return null;
+  }
+}
+
+function writeTask(t: GptProTask): void {
+  writeFileSync(taskPath(), JSON.stringify(t, null, 2));
+}
+
+function clearTask(): void {
+  try { unlinkSync(taskPath()); } catch {}
+}
+
 function usage(): string {
   return [
     "Usage:",
     "  gpt_pro.ts help",
     "  gpt_pro.ts status",
     "  gpt_pro.ts ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
+    "  gpt_pro.ts continue [--url <url>] [--timeout <sec>] [--out <file>]",
+    "      Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and",
+    "      wait for the SAME reply instead of re-dispatching the prompt. ask refuses",
+    "      to re-dispatch while an unfinished task (generating/timed-out, within 2h)",
+    "      is on record; pass --force to ask to discard it.",
     "",
     "Environment:",
     "  OPENCLI_BIN  Path to opencli binary. Defaults to PATH lookup, then /opt/homebrew/bin/opencli.",
@@ -212,15 +269,32 @@ function statusCommand(): number {
   }
 }
 
-function parseAskArgs(args: string[]): { prompt: string; files: string[]; out?: string; timeoutSec: number } {
+function parseAskArgs(args: string[]): AskArgs {
   let prompt: string | undefined;
   let promptFile: string | undefined;
   const files: string[] = [];
   let out: string | undefined;
+  let force = false;
+  let url: string | undefined;
   let timeoutSec = 900;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
+    if (arg === "--force") {
+      force = true;
+      continue;
+    }
+
+    if (arg === "--url") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --url");
+      }
+      url = value;
+      i += 1;
+      continue;
+    }
+
     if (arg === "--prompt-file") {
       const value = args[i + 1];
       if (!value) {
@@ -282,7 +356,7 @@ function parseAskArgs(args: string[]): { prompt: string; files: string[]; out?: 
     throw new Error("missing prompt or file");
   }
 
-  return { prompt: prompt || "", files, out, timeoutSec };
+  return { prompt: prompt || "", files, out, timeoutSec, force, url };
 }
 
 function requireSuccess(result: RunResult, label: string): void {
@@ -335,6 +409,122 @@ function writeAssistantOutput(text: string, out?: string): void {
     writeFileSync(absoluteOut, text, "utf8");
     process.stderr.write(`gpt-pro: result copy saved to ${absoluteOut}\n`);
   }
+}
+
+function waitForAssistantReply(params: {
+  deadline: number;
+  absoluteCeiling: number;
+  baselineCount: number;
+  sentAt: number;
+  prevPartial?: string;
+  out?: string;
+}): WaitOutcome {
+  let deadline = params.deadline;
+  const resumeMode = Object.prototype.hasOwnProperty.call(params, "prevPartial");
+  const generationStartDeadline = Math.min(deadline, params.sentAt + 30000);
+  let sawGenerating = false;
+  let lastText = "";
+  let currentText = "";
+  let currentCount = params.baselineCount;
+  let stableReads = 0;
+
+  const updateSnapshot = (snapshot: { count: number; text: string }): void => {
+    currentCount = snapshot.count;
+    currentText =
+      snapshot.count > params.baselineCount || (resumeMode && snapshot.count >= params.baselineCount)
+        ? snapshot.text
+        : "";
+  };
+  const acceptable = (text: string): boolean => {
+    if (!text) {
+      return false;
+    }
+    return params.prevPartial === undefined || text !== params.prevPartial;
+  };
+  const currentDeadline = (): number => (Date.now() < deadline ? deadline : params.absoluteCeiling);
+
+  while (Date.now() < generationStartDeadline) {
+    const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
+    if (!commandFailed(generating) && generating.stdout.trim() === "true") {
+      sawGenerating = true;
+      break;
+    }
+    if (commandFailed(generating)) {
+      log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
+    }
+
+    const snapshot = readAssistantSnapshot(deadline);
+    if (snapshot) {
+      updateSnapshot(snapshot);
+    }
+
+    if (Date.now() < generationStartDeadline) {
+      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      if (commandFailed(waited)) {
+        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+      }
+    }
+  }
+
+  while (Date.now() < params.absoluteCeiling) {
+    const operationDeadline = currentDeadline();
+    const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], operationDeadline);
+    if (!commandFailed(generating) && generating.stdout.trim() === "true") {
+      sawGenerating = true;
+      if (Date.now() >= deadline && Date.now() < params.absoluteCeiling) {
+        deadline = Math.min(params.absoluteCeiling, deadline + 120000);
+        log(`extending deadline (still generating): +120s, new total budget ${Math.round((deadline - params.sentAt) / 1000)}s`);
+      }
+      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      if (commandFailed(waited)) {
+        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+      }
+      continue;
+    }
+    if (commandFailed(generating)) {
+      log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
+    }
+
+    const snapshot = readAssistantSnapshot(operationDeadline);
+    if (snapshot) {
+      updateSnapshot(snapshot);
+    }
+
+    if (sawGenerating) {
+      if (acceptable(currentText)) {
+        writeAssistantOutput(currentText, params.out);
+        return { status: "completed", text: currentText, lastText, finalDeadline: deadline };
+      }
+    } else if (currentText) {
+      stableReads = currentText === lastText ? stableReads + 1 : 1;
+      lastText = currentText;
+      if (stableReads >= 3 && Date.now() - params.sentAt >= 20000 && acceptable(currentText)) {
+        writeAssistantOutput(currentText, params.out);
+        return { status: "completed", text: currentText, lastText, finalDeadline: deadline };
+      }
+    }
+
+    if (Date.now() < deadline) {
+      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      if (commandFailed(waited)) {
+        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+      }
+    } else if (Date.now() < params.absoluteCeiling) {
+      // Past the initial deadline but within the auto-extend window: avoid a
+      // tight spin while waiting for the next generating/stable check.
+      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], params.absoluteCeiling);
+      if (commandFailed(waited)) {
+        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
+      }
+    }
+  }
+
+  return {
+    status: "timed-out",
+    text: currentText || lastText || "",
+    lastText,
+    finalDeadline: deadline,
+  };
 }
 
 function mimeTypeForPath(filePath: string): string {
@@ -497,13 +687,28 @@ function getComposerIndex(deadline?: number): string | null {
 }
 
 function askCommand(args: string[]): number {
-  let parsed: { prompt: string; files: string[]; out?: string; timeoutSec: number };
+  let parsed: AskArgs;
   try {
     parsed = parseAskArgs(args);
   } catch (error) {
     log(error instanceof Error ? error.message : String(error));
     log(usage());
     return 2;
+  }
+
+  const existing = readTask();
+  const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+  if (existing && existing.status !== "completed" && Date.now() - existing.sentAt < TWO_HOURS_MS && !parsed.force) {
+    const ageMin = Math.round((Date.now() - existing.sentAt) / 60000);
+    log(`unfinished gpt-pro task found (status=${existing.status}, started ${ageMin}m ago, url=${existing.conversationUrl}).`);
+    log(`Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
+    log(`Or pass --force to ask to discard it and start a new conversation.`);
+    log(`Do NOT re-run ask for the same prompt — that opens a new conversation and wastes the already-spent generation time.`);
+    return 2;
+  }
+  if (existing && parsed.force) {
+    log("--force: discarding unfinished gpt-pro task.");
+    clearTask();
   }
 
   let deadline = Date.now() + parsed.timeoutSec * 1000;
@@ -550,99 +755,205 @@ function askCommand(args: string[]): number {
 
     sendPrompt(deadline);
 
+    // Persist the conversation URL as soon as ChatGPT assigns one, so a later
+    // `gpt-pro continue` can reopen this exact conversation if we time out or get
+    // killed. Poll briefly: the URL changes from / to /c/<id> right after send.
+    let conversationUrl = "";
+    let conversationId = "";
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      requireBeforeDeadline(deadline, "extract conversation url");
+      const urlResult = runOpencliWithinDeadline(["browser", "eval", EXTRACT_CONVERSATION_URL_JS], deadline);
+      if (!commandFailed(urlResult)) {
+        try {
+          const payload = JSON.parse(urlResult.stdout.trim()) as { url?: string; pathname?: string };
+          const m = (payload.pathname || "").match(/^\/c\/(.+)$/);
+          if (m && payload.url) {
+            conversationUrl = payload.url;
+            conversationId = m[1];
+            break;
+          }
+        } catch {
+          // ignore non-JSON; retry
+        }
+      }
+      if (attempt < 7) {
+        requireBeforeDeadline(deadline, "wait for conversation url");
+        requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait for conversation url");
+      }
+    }
+    if (conversationUrl) {
+      writeTask({
+        conversationUrl,
+        conversationId,
+        prompt: parsed.prompt,
+        baselineCount,
+        sentAt: Date.now(),
+        status: "generating",
+      });
+    } else {
+      log("warning: could not extract conversation /c/<id> URL; resume via `gpt-pro continue` will be unavailable for this dispatch.");
+    }
+
     const sentAt = Date.now();
-    const generationStartDeadline = Math.min(deadline, sentAt + 30000);
-    let sawGenerating = false;
-    let lastText = "";
-    let currentText = "";
-    let currentCount = baselineCount;
-    let stableReads = 0;
-
-    while (Date.now() < generationStartDeadline) {
-      const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
-      if (!commandFailed(generating) && generating.stdout.trim() === "true") {
-        sawGenerating = true;
-        break;
+    const outcome = waitForAssistantReply({
+      deadline,
+      absoluteCeiling,
+      baselineCount,
+      sentAt,
+      out: parsed.out,
+    });
+    if (outcome.status === "completed") {
+      const task = readTask();
+      if (task) {
+        task.status = "completed";
+        writeTask(task);
+        clearTask();
       }
-      if (commandFailed(generating)) {
-        log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
-      }
-
-      const snapshot = readAssistantSnapshot(deadline);
-      if (snapshot) {
-        currentCount = snapshot.count;
-        currentText = snapshot.count > baselineCount ? snapshot.text : "";
-      }
-
-      if (Date.now() < generationStartDeadline) {
-        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-        if (commandFailed(waited)) {
-          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-        }
-      }
-    }
-
-    while (Date.now() < absoluteCeiling) {
-      const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
-      if (!commandFailed(generating) && generating.stdout.trim() === "true") {
-        sawGenerating = true;
-        if (Date.now() >= deadline && Date.now() < absoluteCeiling) {
-          deadline = Math.min(absoluteCeiling, deadline + 120000);
-          log(`extending deadline (still generating): +120s, new total budget ${Math.round((deadline - sentAt) / 1000)}s`);
-        }
-        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-        if (commandFailed(waited)) {
-          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-        }
-        continue;
-      }
-      if (commandFailed(generating)) {
-        log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
-      }
-
-      const snapshot = readAssistantSnapshot(deadline);
-      if (snapshot) {
-        currentCount = snapshot.count;
-        currentText = snapshot.count > baselineCount ? snapshot.text : "";
-      }
-
-      if (sawGenerating) {
-        if (currentCount > baselineCount && currentText) {
-          writeAssistantOutput(currentText, parsed.out);
-          return 0;
-        }
-      } else if (currentCount > baselineCount && currentText) {
-        stableReads = currentText === lastText ? stableReads + 1 : 1;
-        lastText = currentText;
-        if (stableReads >= 3 && Date.now() - sentAt >= 20000) {
-          writeAssistantOutput(currentText, parsed.out);
-          return 0;
-        }
-      }
-
-      if (Date.now() < deadline) {
-        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-        if (commandFailed(waited)) {
-          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-        }
-      } else if (Date.now() < absoluteCeiling) {
-        // Past the initial deadline but within the auto-extend window: avoid a
-        // tight spin while waiting for the next generating/stable check.
-        const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], absoluteCeiling);
-        if (commandFailed(waited)) {
-          log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-        }
-      }
-    }
-
-    log("timed out waiting for assistant response to stabilize.");
-    if (currentText || lastText) {
-      const partial = currentText || lastText;
-      log("timed out but saving partial assistant response");
-      writeAssistantOutput(partial, parsed.out);
       return 0;
     }
+    log("timed out waiting for assistant response to stabilize.");
+    if (outcome.text) {
+      log("timed out but saving partial assistant response");
+      writeAssistantOutput(outcome.text, parsed.out);
+    }
+    const task = readTask();
+    if (task) {
+      task.status = "timed-out";
+      task.partialText = outcome.text || "";
+      writeTask(task);
+      if (task.conversationUrl) {
+        log(`gpt-pro: timed out. Conversation preserved at ${task.conversationUrl}.`);
+        log(`Resume with: gpt-pro continue (via codex_bridge). Do NOT re-run ask.`);
+      }
+    }
+    return outcome.text ? 0 : 2;
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error));
     return 2;
+  }
+}
+
+function continueCommand(args: string[]): number {
+  let url: string | undefined;
+  let timeoutSec = 900;
+  let out: string | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--url") {
+      url = args[i + 1];
+      if (!url) {
+        log("missing value for --url");
+        log(usage());
+        return 2;
+      }
+      i += 1;
+    } else if (arg === "--timeout") {
+      const v = args[i + 1];
+      if (!v) {
+        log("missing value for --timeout");
+        log(usage());
+        return 2;
+      }
+      timeoutSec = Number(v);
+      if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+        log("--timeout must be a positive number of seconds");
+        return 2;
+      }
+      i += 1;
+    } else if (arg === "--out") {
+      out = args[i + 1];
+      if (!out) {
+        log("missing value for --out");
+        log(usage());
+        return 2;
+      }
+      i += 1;
+    } else if (arg === "--help" || arg === "-h") {
+      process.stdout.write(`${usage()}\n`);
+      return 0;
+    } else {
+      log(`unknown argument: ${arg}`);
+      log(usage());
+      return 2;
+    }
+  }
+
+  const task = readTask();
+  const conversationUrl = url || task?.conversationUrl;
+  const prevPartial = task?.partialText;
+  if (!conversationUrl) {
+    log("no resumable gpt-pro task: no --url given and no gpt-pro-task.json on disk.");
+    log("Run `gpt-pro ask` first; continue only resumes an already-dispatched conversation.");
+    return 2;
+  }
+
+  let deadline = Date.now() + timeoutSec * 1000;
+  const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
+  try {
+    const doctor = runOpencliWithinDeadline(["doctor"], deadline);
+    if (!isBridgeConnected(doctor)) {
+      log("opencli Bridge is not connected.");
+      if (doctor.error) log(doctor.error.message);
+      if (doctor.stderr.trim()) log(doctor.stderr.trim());
+      return 2;
+    }
+
+    requireSuccess(runOpencliWithinDeadline(["browser", "open", conversationUrl], deadline), "opencli browser open conversation");
+    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+
+    // After reload, the page shows the full conversation history. The last
+    // assistant message is the (possibly partial) reply we were waiting on.
+    // Use the current assistant count as baseline and only accept a reply that
+    // differs from any previously-saved partial.
+    const baselineResult = runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    requireSuccess(baselineResult, "opencli browser eval assistant count on resume");
+    const baselineCount = Number(baselineResult.stdout.trim());
+    if (!Number.isFinite(baselineCount)) {
+      throw new Error(`assistant count on resume returned invalid value\n${baselineResult.stdout.trim() || baselineResult.stderr.trim()}`);
+    }
+
+    const sentAt = task?.sentAt || Date.now();
+    log(`resuming gpt-pro conversation ${conversationUrl} (baseline assistant count ${baselineCount}${prevPartial ? ", has prior partial" : ""}).`);
+
+    if (task) {
+      task.status = "generating";
+      task.baselineCount = baselineCount;
+      writeTask(task);
+    }
+
+    const outcome = waitForAssistantReply({
+      deadline,
+      absoluteCeiling,
+      baselineCount,
+      sentAt,
+      prevPartial,
+      out,
+    });
+    if (outcome.status === "completed") {
+      const t = readTask();
+      if (t) {
+        t.status = "completed";
+        writeTask(t);
+        clearTask();
+      }
+      return 0;
+    }
+    log("timed out waiting for assistant response to stabilize on resume.");
+    if (outcome.text) {
+      log("timed out but saving partial assistant response");
+      // writeAssistantOutput already called by the helper when it had accepted
+      // a reply; on timed-out we still print any partial we have.
+      writeAssistantOutput(outcome.text, out);
+    }
+    const t = readTask();
+    if (t) {
+      t.status = "timed-out";
+      t.partialText = outcome.text || "";
+      writeTask(t);
+      log(`gpt-pro: timed out on resume. Conversation preserved at ${t.conversationUrl}.`);
+      log(`Resume again with: gpt-pro continue (via codex_bridge). Do NOT re-run ask.`);
+    }
+    return outcome.text ? 0 : 2;
   } catch (error) {
     log(error instanceof Error ? error.message : String(error));
     return 2;
@@ -659,6 +970,10 @@ function main(): number {
 
   if (command === "status") {
     return statusCommand();
+  }
+
+  if (command === "continue") {
+    return continueCommand(args);
   }
 
   if (command === "ask") {

@@ -17,6 +17,7 @@
 //       Dispatch a task to the local Antigravity CLI (agy) — long-context,
 //       multimodal, live web.
 //   gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+//   gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
 //   gpt-pro status
 //   gpt-pro help
 //       Dispatch to ChatGPT web Pro via opencli Browser Bridge.
@@ -277,6 +278,12 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     args.push("status");
   } else if (command === "help" || command === "--help" || command === "-h") {
     args.push("help");
+  } else if (command === "continue") {
+    args.push("continue");
+    const url = flags.url;
+    if (url) args.push("--url", url);
+    if (flags.timeout) args.push("--timeout", flags.timeout);
+    if (flags.out) args.push("--out", flags.out);
   } else if (command === "ask") {
     const prompt = positional[1];
     const promptFile = flags["prompt-file"];
@@ -292,8 +299,9 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     for (const filePath of filePaths) args.push("--file", filePath);
     if (flags.out) args.push("--out", flags.out);
     if (flags.timeout) args.push("--timeout", flags.timeout);
+    if (flags.force) args.push("--force");
   } else {
-    fail("gpt-pro requires status, ask, or help");
+    fail("gpt-pro requires status, ask, continue, or help");
   }
 
   const scriptDir = path.dirname(new URL(import.meta.url).pathname);
@@ -370,6 +378,8 @@ Usage:
   codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
   codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+  codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
+      Resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL.
   codex_bridge gpt-pro status
   codex_bridge gpt-pro help
       Dispatch to ChatGPT web Pro via opencli Browser Bridge.
