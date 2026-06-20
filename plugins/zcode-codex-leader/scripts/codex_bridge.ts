@@ -9,8 +9,8 @@
 //       Like ask, but reads the prompt from a file and writes the full result to a file.
 //   vision <image-path> <question>
 //       Visual understanding of a local image.
-//   generate-image <prompt> [--out <path>]
-//       Image generation via the worker's image_generation_call capability.
+//   generate-image <prompt> [--out <path>] [--timeout <sec>]
+//       Synchronous image generation via a dedicated one-shot image worker.
 //   mcp-tool <server> <tool> [--args <json>] [--thread]
 //       Direct MCP tool call (bypasses a turn).
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
@@ -28,7 +28,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { runTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
+import { runTurn, runImageTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
 
 function fail(msg: string, code = 1): never {
   process.stderr.write(`codex_bridge: ${msg}\n`);
@@ -163,11 +163,16 @@ async function cmdVision(positional: string[], flags: Record<string, string>): P
   process.stdout.write(`Plugin evidence: vision via codex_bridge.ts — turn ${r.turnId}\n`);
 }
 
-// generate-image: image generation via image_generation_call
+// generate-image: synchronous image generation via a dedicated one-shot image worker.
 async function cmdGenerateImage(positional: string[], flags: Record<string, string>): Promise<void> {
   const prompt = positional.join(" ").trim();
   if (!prompt) fail("generate-image requires a prompt");
-  const r = await runTurn([{ type: "text", text: `Generate an image: ${prompt}` }]);
+  const timeoutSec = flags.timeout ? Number(flags.timeout) : 900;
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) fail(`invalid --timeout: ${flags.timeout}`);
+  const r = await runImageTurn(
+    [{ type: "text", text: `Generate an image: ${prompt}` }],
+    { timeoutMs: Math.round(timeoutSec * 1000) },
+  );
   bumpDispatch();
 
   if (r.imageGeneration.length === 0) {
@@ -360,7 +365,7 @@ Usage:
   codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>]
       Like ask, but reads the prompt from a file and writes the full result to a file. stdout shows only the result path + evidence. Saves leader context tokens.
   codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
-  codex_bridge generate-image <prompt> [--out <path>]
+  codex_bridge generate-image <prompt> [--out <path>] [--timeout <sec>]
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
   codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.

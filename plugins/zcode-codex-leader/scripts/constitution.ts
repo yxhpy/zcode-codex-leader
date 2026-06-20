@@ -52,8 +52,11 @@ Commands:
       Use --output-schema (a JSON Schema file) to force structured/parseable output.
   vision <image-path> <question>
       Visual understanding of a local image (what does it show?).
-  generate-image <prompt> [--out <path>]
-      Image generation. Prints the saved PNG path.
+  generate-image <prompt> [--out <path>] [--timeout <sec>]
+      Synchronous image generation. It starts a dedicated one-shot image worker
+      with image generation enabled, waits for the final imageGeneration item,
+      writes the PNG, and prints the saved PNG path. The resident codex worker
+      still keeps image generation disabled.
   mcp-tool <server> <tool> [--args <json>] [--thread true]
       Direct MCP tool call without a full turn.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
@@ -132,19 +135,23 @@ capability or the bridge: codex must not call agy / gpt-pro / opencli /
 codex_bridge.ts; agy must not call codex / gpt-pro; gpt-pro must not call codex /
 agy. Each worker stays inside its own lane. ZCode is the ONLY router.
 
-The codex worker is started with ALL Codex plugins, MCP servers, memories,
-multi-agent spawning, plugin hooks, goals, built-in apps, browser/computer-use,
-image generation, and tool suggestions DISABLED via -c config overrides. It
-retains only its core capability set: shell (read/write/grep/find), file edit,
-and search. It cannot invoke browser, computer-use, cloudflare, node_repl,
-codex_apps, or any other plugin/app-provided tool. This keeps the worker fast
-and its output clean — no plugin context bloat, no stray MCP tool calls.
-Enforcement is both config-level (the overrides above) AND packet-contract-level:
-every dispatch packet MUST state the worker's allowed tools explicitly and
-forbid the others. Example packet clause: 'You may only use <shell + edit on the
-named files>. Do NOT run opencli, agy, codex_bridge.ts, or any browser automation
-— those are a different worker's lane.' ZCode must not ASSIGN out-of-lane work
-either: do not ask codex to drive opencli, do not ask gpt-pro to edit repo files.
+The resident codex worker is started with ALL Codex plugins, MCP servers,
+memories, multi-agent spawning, plugin hooks, goals, built-in apps,
+browser/computer-use, image generation, and tool suggestions DISABLED via -c
+config overrides. It retains only its core capability set: shell
+(read/write/grep/find), file edit, and search. It cannot invoke browser,
+computer-use, cloudflare, node_repl, codex_apps, image generation, or any other
+plugin/app-provided tool. Image generation is the one explicit exception, and it
+is NOT available to the resident worker: `generate-image` starts a separate
+one-shot image worker, synchronously waits for the image result, then tears that
+worker down. This keeps the worker fast and its output clean — no plugin context
+bloat, no stray MCP tool calls. Enforcement is both config-level (the overrides
+above) AND packet-contract-level: every dispatch packet MUST state the worker's
+allowed tools explicitly and forbid the others. Example packet clause: 'You may
+only use <shell + edit on the named files>. Do NOT run opencli, agy,
+codex_bridge.ts, or any browser automation — those are a different worker's
+lane.' ZCode must not ASSIGN out-of-lane work either: do not ask codex to drive
+opencli, do not ask gpt-pro to edit repo files.
 
 ### Output Discipline (HARD — protect leader context)
 

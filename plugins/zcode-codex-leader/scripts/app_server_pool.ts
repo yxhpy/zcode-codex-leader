@@ -84,18 +84,8 @@ async function isAlive(s: SessionState): Promise<boolean> {
   }
 }
 
-// Start a fresh detached worker, parse its ws URL from stderr, persist state.
-// Returns the new session state, or throws on failure.
-//
-// The worker is deliberately stripped to its core capability set: shell, file
-// read/write/edit, and search. All Codex plugins, MCP servers, memories,
-// multi-agent spawning, plugin hooks, goals, built-in apps, browser/computer-use,
-// image generation, and tool suggestions are disabled via -c config overrides so
-// the worker cannot invoke external tools (browser, computer-use, cloudflare,
-// codex apps, node_repl, etc.) that would slow it down or pollute its output.
-async function startWorker(): Promise<SessionState> {
-  const bin = codexBinary();
-  const workerArgs = [
+function workerArgs(imageGeneration: boolean): string[] {
+  return [
     "app-server", "--listen", "ws://127.0.0.1:0",
     // --- Disable all plugins (browser, chrome, computer-use, cloudflare, documents, etc.)
     "-c", "features.plugins=false",
@@ -109,7 +99,7 @@ async function startWorker(): Promise<SessionState> {
     "-c", "features.browser_use_external=false",
     "-c", "features.computer_use=false",
     "-c", "features.in_app_browser=false",
-    "-c", "features.image_generation=false",
+    "-c", `features.image_generation=${imageGeneration ? "true" : "false"}`,
     "-c", "features.skill_mcp_dependency_install=false",
     "-c", "features.tool_suggest=false",
     // --- Disable memories (avoids stale context injection)
@@ -121,12 +111,16 @@ async function startWorker(): Promise<SessionState> {
     // --- Disable goals (worker receives bounded packets, not goals)
     "-c", "features.goals=false",
   ];
-  const child: ChildProcess = spawn(bin, workerArgs, {
+}
+
+async function spawnWorker(imageGeneration: boolean, persist: boolean): Promise<{ state: SessionState; child: ChildProcess }> {
+  const bin = codexBinary();
+  const child: ChildProcess = spawn(bin, workerArgs(imageGeneration), {
     stdio: ["pipe", "pipe", "pipe"],
-    detached: true,          // survive parent exit
+    detached: persist,      // resident worker survives; one-shot image worker does not
     env: { ...process.env },
   });
-  child.unref();
+  if (persist) child.unref();
 
   const wsUrl = await new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timed out waiting for worker to print ws URL")), 8000);
@@ -150,8 +144,21 @@ async function startWorker(): Promise<SessionState> {
     startedAt: Date.now(),
     dispatchCount: 0,
   };
-  writeSession(state);
-  return state;
+  if (persist) writeSession(state);
+  return { state, child };
+}
+
+// Start a fresh detached worker, parse its ws URL from stderr, persist state.
+// Returns the new session state, or throws on failure.
+//
+// The worker is deliberately stripped to its core capability set: shell, file
+// read/write/edit, and search. All Codex plugins, MCP servers, memories,
+// multi-agent spawning, plugin hooks, goals, built-in apps, browser/computer-use,
+// image generation, and tool suggestions are disabled via -c config overrides so
+// the worker cannot invoke external tools (browser, computer-use, cloudflare,
+// codex apps, node_repl, etc.) that would slow it down or pollute its output.
+async function startWorker(): Promise<SessionState> {
+  return (await spawnWorker(false, true)).state;
 }
 
 // Ensure a live worker exists; (re)start if missing or dead.
@@ -236,11 +243,12 @@ export type TurnResult = {
   rawItems: any[];
 };
 
-export async function runTurn(
+async function runTurnOnState(
+  state: SessionState,
   input: any[],
   opts: { model?: string; cwd?: string; outputSchema?: object; effort?: string } = {},
+  timeoutMs = 300000,
 ): Promise<TurnResult> {
-  const state = await ensureServer();
   const client = await AppServerClient.connect(state.wsUrl);
 
   try {
@@ -287,13 +295,38 @@ export async function runTurn(
 
     // drain until turn/completed (with a hard ceiling)
     const start = Date.now();
-    while (!done && Date.now() - start < 300000) {
+    while (!done && Date.now() - start < timeoutMs) {
       await new Promise((r) => setTimeout(r, 50));
     }
 
     return { turnId, messages, imageGeneration, rawItems };
   } finally {
     client.close();
+  }
+}
+
+export async function runTurn(
+  input: any[],
+  opts: { model?: string; cwd?: string; outputSchema?: object; effort?: string } = {},
+): Promise<TurnResult> {
+  const state = await ensureServer();
+  return runTurnOnState(state, input, opts, 300000);
+}
+
+// Image generation is intentionally isolated from the resident codex worker.
+// The resident worker keeps features.image_generation=false; generate-image uses
+// a one-shot worker with image generation enabled, synchronously waits for the
+// imageGeneration item, then kills that temporary worker.
+export async function runImageTurn(
+  input: any[],
+  opts: { model?: string; cwd?: string; outputSchema?: object; effort?: string; timeoutMs?: number } = {},
+): Promise<TurnResult> {
+  const { state, child } = await spawnWorker(true, false);
+  try {
+    return await runTurnOnState(state, input, opts, opts.timeoutMs || 900000);
+  } finally {
+    try { child.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
   }
 }
 
