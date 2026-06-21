@@ -375,11 +375,14 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
     env: process.env,
     cwd: process.cwd(),
   });
-  // ponytail: forward parent SIGTERM/SIGINT to the agy child so the Bash 600s ceiling doesn't orphan it. Without this, codex_bridge dies but agy keeps running, holding the opencli browser bridge indefinitely.
+  // ponytail: forward parent SIGTERM/SIGINT to the agy child so the Bash 600s ceiling doesn't orphan it. Do NOT process.exit() here — instead signal the child and let the existing child.on("close") resolve the await. This gives the child's own SIGTERM handler (async flush + exit) time to run before the parent dies. Exiting immediately would orphan the child mid-flush.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let forwardedSignal = false;
   const forwardAgySignal = () => {
+    if (forwardedSignal) return;
+    forwardedSignal = true;
     try { child.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000);
-    process.exit(143);
+    killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000);
   };
   process.on("SIGTERM", forwardAgySignal);
   process.on("SIGINT", forwardAgySignal);
@@ -389,7 +392,6 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
   child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
 
   let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const hardTimeoutMs = parseAgyTimeoutMs(printTimeout) + 10000;
   const code = await new Promise<number | null>((resolve) => {
     const timer = setTimeout(() => {
@@ -459,11 +461,14 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     env: process.env,
     cwd: process.cwd(),
   });
-  // ponytail: forward parent SIGTERM/SIGINT to the gpt_pro child so the Bash 600s ceiling doesn't orphan it. Without this, codex_bridge dies but gpt_pro keeps running, holding the opencli browser bridge indefinitely.
+  // ponytail: forward parent SIGTERM/SIGINT to the gpt_pro child so the Bash 600s ceiling doesn't orphan it. Do NOT process.exit() here — instead signal the child and let the existing child.on("close") resolve the await. This gives the child's own SIGTERM handler (async flush + exit) time to run before the parent dies. Exiting immediately would orphan the child mid-flush and lose the partial output we're trying to save.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let forwardedSignal = false;
   const forwardSignal = () => {
+    if (forwardedSignal) return;
+    forwardedSignal = true;
     try { child.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000);
-    process.exit(143);
+    killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000);
   };
   process.on("SIGTERM", forwardSignal);
   process.on("SIGINT", forwardSignal);
@@ -473,7 +478,6 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
   child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
 
   let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const timeoutForHardLimit = flags.timeout && /^\d+$/.test(flags.timeout) ? `${flags.timeout}s` : flags.timeout;
   // ponytail: outer budget must cover inner gpt_pro.ts auto-extend ceiling (MAX_AUTO_EXTEND_MS=1800000) + a 60s buffer,
   // otherwise the wrapper SIGTERMs the child mid-extend and long Pro tasks die as "unstable".
