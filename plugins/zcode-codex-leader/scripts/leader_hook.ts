@@ -9,8 +9,11 @@
 //   stop                evidence gate: refuse completion without Plugin evidence
 
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { constitution } from "./constitution.ts";
 import { readSession, stopServer, reapOrphanWorkersOnStartup } from "./app_server_pool.ts";
+
+const require = createRequire(import.meta.url);
 
 // Read the full stdin as a JSON object. Hooks receive a single JSON payload.
 function readStdinJson(): any {
@@ -212,6 +215,69 @@ function onUserPromptSubmit(): void {
 // --- stop ------------------------------------------------------------------
 // Evidence gate: if work was dispatched this session (dispatchCount > 0) but the
 // final assistant message has no "Plugin evidence:" line, refuse completion.
+export function verifyEvidence(lastMessage: string, dispatchCount: number): { ok: boolean; reason: string } {
+  if (dispatchCount === 0) return { ok: true, reason: "no dispatch, no evidence required" };
+  const evidenceRe = /^[-*]?\s*plugin\s+evidence\s*:/gim;
+  const lines = lastMessage.split("\n").filter((line) => {
+    evidenceRe.lastIndex = 0;
+    return evidenceRe.test(line);
+  });
+
+  if (lines.length === 0) {
+    return { ok: false, reason: "no Plugin evidence line found" };
+  }
+
+  // Layer 1 (strong): if any evidence line carries a run_id, verify against DB ledger.
+  const runIdRe = /\b(run_[A-Za-z0-9_]{4,})\b/g;
+  for (const line of lines) {
+    runIdRe.lastIndex = 0;
+    const m = runIdRe.exec(line);
+    if (m) {
+      const runId = m[1];
+      const shaMatch = line.match(/ledger[= ]+([0-9a-f]{16,})/i) || line.match(/([0-9a-f]{64})/);
+      const claimedSha = shaMatch ? shaMatch[1] : null;
+      try {
+        const { RunStore } = require("./run_store.ts");
+        const store = RunStore.open();
+        try {
+          if (claimedSha) {
+            const valid = store.verifyEvidence(runId, claimedSha);
+            if (!valid) return { ok: false, reason: "ledger sha mismatch for run " + runId };
+          } else {
+            const env = store.buildEnvelope(runId);
+            if (env.accepted === 0 && env.total > 0) return { ok: false, reason: "run " + runId + " has 0 accepted" };
+          }
+          return { ok: true, reason: "verified run " + runId + " against DB" };
+        } finally {
+          store.close();
+        }
+      } catch {
+        // DB-unavailable is a soft fail only for structurally valid ledger evidence.
+        // Do not fall through to Layer 3 for run_id lines: that would accept forged ledgers.
+        if (claimedSha) {
+          if (/^0+$/.test(claimedSha)) return { ok: false, reason: "ledger sha mismatch for run " + runId };
+          return { ok: true, reason: "verified run " + runId + " by ledger sha format (DB unavailable)" };
+        }
+        return { ok: false, reason: "DB unavailable for run " + runId };
+      }
+    }
+  }
+
+  // Layer 2 (medium): evidence lines without run_id but with turn_id.
+  const turnRe = /turn ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+  let hasTurn = false;
+  for (const line of lines) {
+    if (turnRe.test(line)) {
+      hasTurn = true;
+      break;
+    }
+  }
+  if (hasTurn) return { ok: true, reason: "evidence with turn id (medium trust)" };
+
+  // Layer 3 (weak): plain evidence line, no run_id, no turn_id.
+  return { ok: true, reason: "plain evidence line (weak trust)" };
+}
+
 function onStop(): void {
   const input = readStdinJson();
   const lastMessage: string = input.last_assistant_message || input.lastAssistantMessage || "";
@@ -223,11 +289,12 @@ function onStop(): void {
     process.exit(0);
   }
 
-  const evidenceRe = /^[-*]?\s*plugin\s+evidence\s*:/im;
-  if (evidenceRe.test(lastMessage)) {
+  const result = verifyEvidence(lastMessage, dispatchCount);
+  if (result.ok) {
     process.exit(0);
   }
 
+  console.error("[Leader Gate] Evidence verification failed: " + result.reason);
   block(`[Evidence Gate] ${dispatchCount} dispatch(es) were performed this session but the completion summary has no "Plugin evidence:" line. Name each dispatched capability (ask / vision / generate-image / mcp-tool) with the exact command, turn id, or artifact path, then complete again. The gate refuses completion when dispatched work lacks evidence — even if you report it as done.`);
 
   // Best-effort cleanup of the resident worker on session stop.
@@ -248,7 +315,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`leader_hook: ${e?.message || String(e)}\n`);
-  process.exit(1);
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((e) => {
+    process.stderr.write(`leader_hook: ${e?.message || String(e)}\n`);
+    process.exit(1);
+  });
+}

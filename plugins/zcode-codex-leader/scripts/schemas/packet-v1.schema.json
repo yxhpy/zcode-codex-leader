@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-codex-leader/packet-v1.schema.json",
+  "title": "PacketV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "packet_id",
+    "packet_revision",
+    "dag_version",
+    "title",
+    "objective",
+    "kind",
+    "model_tier",
+    "depends_on",
+    "priority",
+    "inputs",
+    "scope",
+    "acceptance",
+    "execution",
+    "retry_policy",
+    "side_effect"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "packet_id": {
+      "type": "string"
+    },
+    "packet_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1
+    },
+    "dag_version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "ask",
+        "parse",
+        "web",
+        "vision",
+        "generate-image",
+        "test",
+        "mcp-tool",
+        "agy",
+        "gpt-pro"
+      ]
+    },
+    "model_tier": {
+      "enum": [
+        "fast",
+        "balanced",
+        "strong"
+      ]
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "priority": {
+      "type": "integer",
+      "default": 0
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_ref",
+        "context_refs",
+        "artifact_refs"
+      ],
+      "properties": {
+        "request_ref": {
+          "type": "string"
+        },
+        "context_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "read_globs",
+        "write_globs",
+        "forbidden_globs",
+        "base_revision",
+        "workspace_id"
+      ],
+      "properties": {
+        "read_globs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_globs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forbidden_globs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "base_revision": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checks",
+        "output_schema_ref"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "value"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "command",
+                  "file",
+                  "schema",
+                  "review"
+                ]
+              },
+              "value": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "output_schema_ref": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timeout_ms",
+        "heartbeat_interval_ms",
+        "no_progress_timeout_ms",
+        "max_turns"
+      ],
+      "properties": {
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "heartbeat_interval_ms": {
+          "type": "integer",
+          "default": 15000
+        },
+        "no_progress_timeout_ms": {
+          "type": "integer",
+          "default": 90000
+        },
+        "max_turns": {
+          "type": "integer",
+          "default": 10
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "initial_backoff_ms",
+        "max_backoff_ms",
+        "retry_on"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "initial_backoff_ms": {
+          "type": "integer",
+          "default": 1000
+        },
+        "max_backoff_ms": {
+          "type": "integer",
+          "default": 30000
+        },
+        "retry_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "worker_crash",
+            "timeout",
+            "protocol_error"
+          ]
+        }
+      }
+    },
+    "side_effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "idempotency_key",
+        "reconcile_strategy",
+        "compensation_packet_id"
+      ],
+      "properties": {
+        "class": {
+          "enum": [
+            "none",
+            "repo_local",
+            "external_idempotent",
+            "external_irreversible"
+          ]
+        },
+        "idempotency_key": {
+          "type": "string",
+          "default": ""
+        },
+        "reconcile_strategy": {
+          "type": "string",
+          "default": ""
+        },
+        "compensation_packet_id": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    }
+  }
+}

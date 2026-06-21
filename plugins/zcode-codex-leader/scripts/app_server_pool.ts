@@ -110,6 +110,12 @@ export const MODEL_TIERS = {
   strong: { model: "gpt-5.5", effort: "high", serviceTier: "default" },
 } as const;
 
+// ponytail: restart budget — window-based, prevents crash loop. global lock, per-worker if throughput matters.
+const RESTART_WINDOW_MS = 10 * 60 * 1000;        // 10 min window
+const RESTART_MAX_IN_WINDOW = 3;                  // max 3 restarts per window
+const RESTART_INITIAL_BACKOFF_MS = 1000;
+const RESTART_MAX_BACKOFF_MS = 30_000;
+
 type ModelTierName = keyof typeof MODEL_TIERS;
 type ModelRoutingOpts = {
   model?: string;
@@ -155,6 +161,9 @@ type SessionState = {
   wsUrl: string;
   healthUrl: string;
   startedAt: number;
+  workerEpoch: number;
+  restartCount: number;
+  restartedAt: number;
   threadId?: string;
   dispatchCount: number;
 };
@@ -168,12 +177,29 @@ const DEFAULT_TURN_CEILING_MS = 300000;
 const AUTH_FAILURE_HINT = "Codex authentication failed — your ChatGPT/Codex login looks expired or invalid. Run `codex login` to refresh, then retry.";
 
 // Raised when the resident worker is wedged (turn/start timed out). runTurn
-// catches it, kills the worker, clears the session, and retries once on a fresh
-// worker via ensureServer. Turns the old 120s hard hang into ~12s + respawn.
+// catches it, kills the stale worker, and retries once via ensureServer.
+// Turns the old 120s hard hang into ~12s + respawn.
 class WorkerStaleError extends Error {
-  constructor(message: string) {
+  workerEpoch?: number;
+
+  constructor(message: string, workerEpoch?: number) {
     super(message);
     this.name = "WorkerStaleError";
+    this.workerEpoch = workerEpoch;
+  }
+}
+
+export class WorkerUnavailableError extends Error {
+  readonly restartCount?: number;
+  readonly startedAt?: number;
+
+  constructor(message: string, info?: { restartCount: number; startedAt: number }) {
+    super(message);
+    this.name = "WorkerUnavailableError";
+    if (info) {
+      this.restartCount = info.restartCount;
+      this.startedAt = info.startedAt;
+    }
   }
 }
 
@@ -224,6 +250,9 @@ export function readSession(): SessionState | null {
     if (!existsSync(sessionPath())) return null;
     const s = JSON.parse(readFileSync(sessionPath(), "utf8")) as SessionState;
     if (!s || !s.wsUrl || !s.pid) return null;
+    s.workerEpoch = Number.isFinite(s.workerEpoch) && s.workerEpoch > 0 ? s.workerEpoch : 1;
+    s.restartCount = Number.isFinite(s.restartCount) && s.restartCount >= 0 ? s.restartCount : 0;
+    s.restartedAt = Number.isFinite(s.restartedAt) && s.restartedAt >= 0 ? s.restartedAt : 0;
     return s;
   } catch {
     return null;
@@ -236,6 +265,10 @@ function writeSession(s: SessionState): void {
 
 function unlinkSession(): void {
   try { unlinkSync(sessionPath()); } catch {}
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function bumpDispatch(): number {
@@ -330,14 +363,23 @@ async function spawnWorker(imageGeneration: boolean, persist: boolean): Promise<
     wsUrl,
     healthUrl: `${wsUrl.replace("ws://", "http://")}/healthz`,
     startedAt: Date.now(),
+    workerEpoch: 1,
+    restartCount: 0,
+    restartedAt: Date.now(),
     dispatchCount: 0,
   };
   if (persist) writeSession(state);
   return { state, child };
 }
 
-async function startWorker(): Promise<SessionState> {
+async function startWorker(restartMeta?: Pick<SessionState, "workerEpoch" | "restartCount" | "restartedAt">): Promise<SessionState> {
   const { state, child } = await spawnWorker(false, true);
+  if (restartMeta) {
+    state.workerEpoch = restartMeta.workerEpoch;
+    state.restartCount = restartMeta.restartCount;
+    state.restartedAt = restartMeta.restartedAt;
+    writeSession(state);
+  }
   residentChild = child;
   try {
     return await ensureResidentThread(state, process.cwd());
@@ -375,16 +417,36 @@ export async function ensureServer(): Promise<SessionState> {
     residentThreadStale = false;
     return withThread;
   }
-  // The session worker is dead or stale: kill it (best effort) and clear state.
+  // The session worker is dead or stale: kill it (best effort) and preserve
+  // session metadata long enough for restart budget/backoff.
+  let restartMeta: Pick<SessionState, "workerEpoch" | "restartCount" | "restartedAt"> | undefined;
   if (s) {
+    const now = Date.now();
+    const restartCountInWindow = now - s.restartedAt < RESTART_WINDOW_MS ? s.restartCount : 0;
+    if (restartCountInWindow >= RESTART_MAX_IN_WINDOW) {
+      throw new WorkerUnavailableError("restart budget exhausted", {
+        restartCount: restartCountInWindow,
+        startedAt: s.startedAt,
+      });
+    }
+    const backoff = Math.min(
+      RESTART_MAX_BACKOFF_MS,
+      RESTART_INITIAL_BACKOFF_MS * 2 ** Math.min(restartCountInWindow, 5),
+    );
     try { killProcessGroup(s.pid, "SIGKILL"); } catch {}
-    unlinkSession();
+    await sleep(backoff);
+    restartMeta = {
+      workerEpoch: s.workerEpoch + 1,
+      restartCount: restartCountInWindow + 1,
+      restartedAt: now,
+    };
+    writeSession({ ...s, ...restartMeta });
   }
   residentChild = undefined;
   // Reap leaked workers from previous crashed sessions before spawning a new
   // one, so they stop holding ChatGPT concurrency slots and loopback ports.
   reapOrphanWorkers(null);
-  return startWorker();
+  return startWorker(restartMeta);
 }
 
 type JsonRpcMsg = { jsonrpc?: "2.0"; id?: string; method?: string; params?: any; result?: any; error?: any };
@@ -630,7 +692,7 @@ async function rpcTurn(
     if (/rpc timeout: turn\/start/i.test(e?.message || "")) {
       residentThreadStale = true;
       if (!ephemeralThread) clearCachedThread(state);
-      throw new WorkerStaleError(`turn/start timed out — worker wedged: ${e?.message || e}`);
+      throw new WorkerStaleError(`turn/start timed out — worker wedged: ${e?.message || e}`, state.workerEpoch);
     }
     throw e;
   }
@@ -671,6 +733,7 @@ export type TurnResult = {
   rawItems: any[];
   tier?: string;
   model?: string;
+  workerEpoch?: number;
 };
 
 async function runTurnOnState(
@@ -686,6 +749,7 @@ async function runTurnOnState(
   const notificationPollMs = NOTIFICATION_POLL_TIMEOUT_MS;
   const postToolQuietMs = POST_TOOL_QUIET_TIMEOUT_MS;
   const turnCeiling = timeoutMs || DEFAULT_TURN_CEILING_MS;
+  const turnEpoch = state.workerEpoch;
 
   try {
     await initializeClient(client);
@@ -749,6 +813,12 @@ async function runTurnOnState(
 
       client.onNotification((m) => {
         const now = Date.now();
+        const currentEpoch = readSession()?.workerEpoch ?? turnEpoch;
+        if (currentEpoch > turnEpoch) {
+          residentThreadStale = true;
+          finish("workerEpochChanged");
+          return;
+        }
         lastNotificationAt = now;
         if (m.method === "item/completed") {
           const item = m.params?.item || {};
@@ -807,6 +877,10 @@ async function runTurnOnState(
 
     const { reason: breakReason } = await turnFinished;
 
+    if (breakReason === "workerEpochChanged") {
+      throw new WorkerStaleError(`worker epoch advanced from ${turnEpoch}`, turnEpoch);
+    }
+
     if (breakReason && !done) {
       const elapsedMs = Date.now() - startedAt;
       const quietMs = Date.now() - lastNotificationAt;
@@ -831,21 +905,24 @@ async function runTurnOnState(
 export async function runTurn(input: any[], opts: RunTurnOpts = {}): Promise<TurnResult> {
   let state = await ensureServer();
   try {
-    return await runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+    const result = await runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+    result.workerEpoch = state.workerEpoch;
+    return result;
   } catch (e) {
     // A wedged resident worker raises WorkerStaleError from rpcTurn (turn/start
-    // timed out). Kill it, clear the session so ensureServer spawns a fresh
-    // worker, and retry the turn exactly once. Turns a hard 120s hang into
-    // ~12s (turn/start ceiling) + worker respawn (~1s) + the retry.
+    // timed out). Kill it, let ensureServer apply restart budget/backoff, and
+    // retry the turn exactly once.
     if (e instanceof WorkerStaleError) {
+      const oldEpoch = e.workerEpoch ?? state.workerEpoch;
       const stale = readSession();
-      if (stale) {
+      if (stale && stale.workerEpoch <= oldEpoch) {
         try { killProcessGroup(stale.pid, "SIGKILL"); } catch {}
-        unlinkSession();
+        residentChild = undefined;
       }
-      residentChild = undefined;
       state = await ensureServer();
-      return runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+      const result = await runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+      result.workerEpoch = state.workerEpoch;
+      return result;
     }
     throw e;
   }
@@ -928,6 +1005,9 @@ export async function runTestTurn(
     wsUrl,
     healthUrl: `${wsUrl.replace("ws://", "http://")}/healthz`,
     startedAt: Date.now(),
+    workerEpoch: 1,
+    restartCount: 0,
+    restartedAt: Date.now(),
     dispatchCount: 0,
   };
 

@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-codex-leader/result-v1.schema.json",
+  "title": "ResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "packet_id",
+    "attempt_id",
+    "status",
+    "summary",
+    "files_changed",
+    "tests",
+    "artifacts",
+    "risks",
+    "blockers",
+    "evidence",
+    "suggested_packets"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "packet_id": {
+      "type": "string"
+    },
+    "attempt_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "blocked",
+        "needs_input"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 800
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "before_sha",
+          "after_sha"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "before_sha": {
+            "type": "string",
+            "default": ""
+          },
+          "after_sha": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "default": []
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command_id",
+          "status",
+          "exit_code",
+          "log_digest"
+        ],
+        "properties": {
+          "command_id": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "skipped"
+            ]
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "log_digest": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "default": []
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "patch",
+              "image",
+              "log",
+              "other"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "default": []
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "maxItems": 10
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "maxItems": 10
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "ref"
+        ],
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          }
+        }
+      },
+      "default": []
+    },
+    "suggested_packets": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "maxItems": 5
+    }
+  }
+}

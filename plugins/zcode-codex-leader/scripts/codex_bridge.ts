@@ -36,7 +36,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { runTurn, runImageTurn, runTestTurn, callMcpTool, bumpDispatch, pluginDataDir } from "./app_server_pool.ts";
+import { RunStore, type PacketInput } from "./run_store.ts";
 
 function fail(msg: string, code = 1): never {
   process.stderr.write(`codex_bridge: ${msg}\n`);
@@ -59,6 +61,27 @@ function parseArgs(argv: string[]): { sub: string; positional: string[]; flags: 
     }
   }
   return { sub, positional, flags };
+}
+
+// ponytail: minimal flag parser - no dep, covers --flag value / --flag (boolean).
+function parseFlags(args: string[], spec: Record<string, "string" | "boolean">): { flags: Record<string, string | boolean | undefined>; positional: string[] } {
+  const flags: Record<string, string | boolean | undefined> = {};
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const name = a.slice(2);
+      const type = spec[name];
+      if (type === "boolean") {
+        flags[name] = true;
+      } else if (type === "string") {
+        flags[name] = args[++i];
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { flags, positional };
 }
 
 function readJsonFile(p: string): any {
@@ -460,6 +483,197 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
   bumpDispatch();
 }
 
+// Generate a candidate DAG plan by dispatching a read-only planner packet to the worker.
+// Returns structured plan JSON via --output-schema. Leader approves/modifies before 'run'.
+async function cmdPlan(args: string[]): Promise<void> {
+  // args: <request-file> [--tier <t>] [--out <path>]
+  const requestFile = args[0];
+  if (!requestFile) {
+    console.error("plan: missing <request-file>");
+    process.exit(2);
+  }
+  const parsed = parseFlags(args.slice(1), { tier: "string", out: "string" });
+  const request = readFileSync(requestFile, "utf8");
+  const packetFields = [
+    "packet_id",
+    "run_id",
+    "kind",
+    "model_tier",
+    "objective",
+    "depends_on",
+    "priority",
+    "write_globs",
+    "base_revision",
+  ] satisfies Array<keyof PacketInput>;
+  const prompt = "You are a planner. Read the request and decompose it into a dependency-ordered DAG of bounded packets. Return strict JSON matching the output schema. Each packet has: " + packetFields[0] + " (pkt_<n>), " + packetFields[1] + " (omit, filled by caller), " + packetFields[2] + ", " + packetFields[3] + ", " + packetFields[4] + " (one sentence), " + packetFields[5] + " (packet_ids), " + packetFields[6] + " (int), " + packetFields[7] + " (string[]), " + packetFields[8] + " (\"HEAD\"). Only split when there are real dependencies or parallelism benefit; otherwise return a single packet. Max 8 packets. Request:\n" + request;
+  const schemaPath = new URL("./schemas/packet-v1.schema.json", import.meta.url);
+  // planner uses output-schema to force JSON array of packets
+  const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : undefined;
+  const tier = typeof parsed.flags.tier === "string" ? parsed.flags.tier : "strong";
+  // delegate to existing ask machinery with output-schema
+  const askArgs = [prompt, "--output-schema", schemaPath.pathname, "--tier", tier];
+  if (outPath) askArgs.push("--out", outPath);
+  // reuse cmdAsk by calling its logic - but cmdAsk is async and reads process.argv.
+  // Simpler: spawn this same bridge with 'ask' subcommand.
+  const child = spawn(process.execPath, [process.argv[1], "ask", ...askArgs], { stdio: "inherit" });
+  const code = await new Promise<number>((resolve) => child.on("exit", (exitCode) => resolve(exitCode ?? 1)));
+  console.log("Plugin evidence: plan via codex_bridge.ts — delegated to ask with output-schema");
+  if (code !== 0) process.exit(code);
+}
+
+// Print run status from the SQLite store. Compact stdout by default, full JSON with --json.
+async function cmdStatus(args: string[]): Promise<void> {
+  // args: --run <run_id> [--json]
+  const parsed = parseFlags(args, { run: "string", json: "boolean" });
+  const runId = typeof parsed.flags.run === "string" ? parsed.flags.run : undefined;
+  if (!runId) {
+    console.error("status: missing --run <run_id>");
+    process.exit(2);
+  }
+  let store: RunStore;
+  try {
+    store = RunStore.open();
+  } catch {
+    const empty = {
+      run_id: runId,
+      status: "unknown",
+      accepted: 0,
+      rejected: 0,
+      stale: 0,
+      total: 0,
+      ledger_sha: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      evidence_lines: [] as string[],
+    };
+    if (parsed.flags.json) {
+      console.log(JSON.stringify(empty, null, 2));
+    } else {
+      console.log(`run ${runId}: status=unknown accepted=0/0 rejected=0 stale=0 ledger=(empty)`);
+    }
+    return;
+  }
+  try {
+    const envelope = store.buildEnvelope(runId);
+    if (parsed.flags.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+    } else {
+      console.log(`run ${envelope.run_id}: status=${envelope.status} accepted=${envelope.accepted}/${envelope.total} rejected=${envelope.rejected} stale=${envelope.stale} ledger=${envelope.ledger_sha.slice(0, 12)}`);
+      for (const line of envelope.evidence_lines) console.log("  " + line);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function cmdRun(args: string[]): Promise<number> {
+  const parsed = parseFlags(args, { plan: "string", "max-parallel": "string", run: "string" });
+  const planFile = parsed.flags.plan as string | undefined;
+  const existingRun = parsed.flags.run as string | undefined;
+  const maxParallel = Math.max(1, parseInt(String(parsed.flags["max-parallel"] ?? "1"), 10) || 1);
+  let runId = "";
+  let packets: PacketInput[] | undefined;
+  let requestHash: string | undefined;
+  if (existingRun) {
+    runId = existingRun;
+  } else if (planFile) {
+    const planText = readFileSync(planFile, "utf8");
+    const plan = JSON.parse(planText);
+    const rawPackets = (plan.packets ?? plan) as any[];
+    if (!Array.isArray(rawPackets) || rawPackets.length === 0) {
+      console.error("run: plan has no packets");
+      return 2;
+    }
+    runId = "run_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    requestHash = createHash("sha256").update(planText).digest("hex").slice(0, 16);
+    packets = rawPackets.map((p) => ({ ...p, run_id: runId }));
+  } else {
+    console.error("run: requires --plan <file> or --run <run_id>");
+    return 2;
+  }
+  const store = RunStore.open();
+  try {
+    if (existingRun) {
+      const run = store.getRun(runId);
+      if (!run) {
+        console.error("run: no such run: " + runId);
+        return 2;
+      }
+      store.appendEvent(runId, "__run__", null, "resume_started", {});
+    } else if (packets && requestHash) {
+      store.createRun(runId, requestHash, packets);
+      console.error("run: created " + runId + " with " + packets.length + " packets");
+    }
+    while (!store.isRunTerminal(runId)) {
+      const ready = store.claimReadyPackets(runId, maxParallel);
+      if (ready.length === 0) {
+        if (hasInFlightPackets(store, runId)) {
+          await sleep(500);
+          continue;
+        }
+        console.error("run: DAG deadlock");
+        store.setRunStatus(runId, "deadlocked");
+        break;
+      }
+      for (const packetId of ready) {
+        const outcome = await executePacket(store, runId, packetId);
+        if (outcome.status === "rejected" || outcome.status === "stale") {
+          store.failDependents(runId, packetId);
+        }
+      }
+    }
+
+    const envelope = store.buildEnvelope(runId);
+    const finalStatus = envelope.accepted === envelope.total ? "succeeded" : (envelope.accepted > 0 ? "partial" : "failed");
+    store.setRunStatus(runId, finalStatus);
+    console.log(JSON.stringify({ run_id: runId, status: finalStatus, accepted: envelope.accepted, total: envelope.total, rejected: envelope.rejected, stale: envelope.stale, ledger_sha: envelope.ledger_sha }));
+    console.log("Plugin evidence: run via codex_bridge.ts — " + runId + " accepted=" + envelope.accepted + "/" + envelope.total);
+    return envelope.accepted === envelope.total ? 0 : 1;
+  } finally { store.close(); }
+}
+
+async function executePacket(store: RunStore, runId: string, packetId: string): Promise<{ status: string; exitCode: number; summary: string }> {
+  const pkt = store.getPacket(packetId);
+  if (!pkt) throw new Error("packet disappeared: " + packetId);
+  const attemptId = store.beginAttempt(packetId, runId, 1);
+  const childArgs = [pkt.kind, pkt.objective, "--tier", pkt.model_tier];
+  const child = spawn(process.execPath, [process.argv[1], ...childArgs], { stdio: ["ignore", "pipe", "pipe"], shell: false });
+  let stdout = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); if (stdout.length > 1_000_000) stdout = stdout.slice(-500_000); });
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); if (stderr.length > 500_000) stderr = stderr.slice(-250_000); });
+  const code = await new Promise<number>((resolve) => {
+    child.on("error", () => resolve(-1));
+    child.on("exit", (c) => resolve(c ?? -1));
+  });
+  const status = code === 0 ? "accepted" : "rejected";
+  const evLine = stdout.split(String.fromCharCode(10)).filter((line) => line.includes("Plugin evidence:"))[0];
+  const outcome = { status, exitCode: code, summary: (evLine ?? stdout.slice(0, 200)).trim() || ("exit " + code) };
+  store.applyOutcome(attemptId, packetId, outcome);
+  if (status === "accepted") {
+    const turnMatch = stdout.match(/turn ([0-9a-f-]+)/);
+    store.recordEvidence(runId, packetId, attemptId, pkt.kind, pkt.objective.slice(0, 80), turnMatch ? turnMatch[1] : "unknown");
+  }
+  return outcome;
+}
+
+async function cmdResume(args: string[]): Promise<number> {
+  const parsed = parseFlags(args, { run: "string" });
+  const runId = parsed.flags.run as string | undefined;
+  if (!runId) {
+    console.error("resume: missing --run <run_id>");
+    return 2;
+  }
+  return cmdRun(["--run", runId]);
+}
+
+function hasInFlightPackets(store: RunStore, runId: string): boolean {
+  const env = store.buildEnvelope(runId);
+  return env.total > env.accepted + env.rejected + env.stale;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function main(): Promise<void> {
   const { sub, positional, flags } = parseArgs(process.argv.slice(2));
   switch (sub) {
@@ -471,6 +685,10 @@ async function main(): Promise<void> {
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "test":           return cmdTest(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
+    case "plan":           return cmdPlan(rawArgsAfterSubcommand("plan"));
+    case "status":         return cmdStatus(rawArgsAfterSubcommand("status"));
+    case "run":            process.exit(await cmdRun(rawArgsAfterSubcommand("run")));
+    case "resume":         process.exit(await cmdResume(rawArgsAfterSubcommand("resume")));
     case "agy":            return cmdAgy(positional, flags);
     case "gpt-pro":        return cmdGptPro(positional, flags);
     case "help":
@@ -505,6 +723,16 @@ Usage:
   codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
   codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
+  codex_bridge plan <request-file> [--tier <t>] [--out <path>]
+      Generate a candidate DAG plan (read-only planner packet).
+  codex_bridge status --run <run_id> [--json]
+      Print run status from the SQLite store.
+  codex_bridge run --plan <plan.json> [--max-parallel 1]
+      Execute an approved DAG plan to completion (SLW join point).
+  codex_bridge run --run <run_id>
+      Resume an interrupted run.
+  codex_bridge resume --run <run_id>
+      Alias for 'run --run'.
   codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
   codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
       Resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL.

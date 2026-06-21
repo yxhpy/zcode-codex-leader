@@ -27,6 +27,23 @@ Resilience (0.5.0): resident thread reuse (no per-dispatch cold start), wedge wa
 Worker lifecycle hardening (0.6.0): closes the dual-process blind spot where a half-dead worker (node launcher pid A dead, codex binary pid B still serving WS) was reused and hung `turn/start` for the full 120s RPC ceiling. Now `ensureServer` pre-checks pid A liveness before trusting the WS, RPC timeouts are per-method (turn/start 12s, default 60s), a `turn/start` timeout raises `WorkerStaleError` which `runTurn` turns into an automatic kill + restart + single retry (turn done turns a hard 120s hang into ~5s self-heal). Orphaned workers from crashed sessions are reaped on `SessionStart` and on every reconnect via a ppid-chain fingerprint match. Turn completion switched from `while()+sleep()` polling to event-driven (`turn/completed` / WS close / post-tool-quiet / parent-pid-gone / ceiling, first wins), mirroring the official codex-plugin-cc `captureTurn` model.
 Approval-hang fix (0.6.1): the resident worker previously inherited codex's default approval policy, so any dispatch that ran a dangerous shell op (`rm`, `mv`, network) blocked forever in app-server mode — there is no TTY and no human to answer the approval prompt, so `turn/start` hung until the RPC ceiling and the whole dispatch timed out. This is the actual root cause behind the "second turn hangs" reports: the first turn (e.g. a probe) returned text-only, but any follow-up that touched the filesystem with a destructive command wedged. Now `workerArgs` passes `approval_policy=never` + `sandbox_mode=workspace-write` explicitly via `-c`, which is required because codex has a known bug ([openai/codex#27617](https://github.com/openai/codex/issues/27617)) where `approval_policy` in `config.toml` is ignored unless set on the command line. Verified: `rm -f probe.txt` + `apply_patch ADD` now returns DONE in ~10s instead of hanging.
 
+## DAG run management (0.8.0)
+
+The bridge now supports persistent, resumable DAG-based task runs. A run decomposes a request into bounded packets with explicit dependencies; state is durably persisted to SQLite, so an interrupted run can be resumed in a later session.
+
+| Command | What it does |
+|---------|--------------|
+| `plan <request-file>` | Generate a candidate DAG plan via a read-only planner packet |
+| `run --plan <plan.json>` | Execute an approved DAG plan to completion (SLW join point) |
+| `run --run <run_id>` / `resume --run <run_id>` | Resume an interrupted run |
+| `status --run <run_id> [--json]` | Query run state from the SQLite store |
+
+State lives in `/runs.sqlite` alongside `session.json`. The packet state machine (`planned → ready → dispatched → accepted/rejected/stale`) uses optimistic CAS transitions; dependency failures cascade `stale` to downstream packets. Evidence is recorded per-packet and aggregated into a ledger hash that the Stop hook verifies against the DB — closing the forgery hole where the leader could previously emit a fabricated `Plugin evidence:` line.
+
+Worker lifecycle is now epoch-aware: each resident worker restart increments `workerEpoch` and enforces a windowed restart budget (3 restarts per 10 minutes, exponential backoff) to prevent crash loops. Late-arriving output from a superseded epoch is rejected.
+
+Run `node --experimental-strip-types scripts/run_store.ts` for a built-in self-check, or `node --experimental-strip-types scripts/chaos_test.ts` for the full fault-tolerance suite (CAS conflicts, stale cascades, resume-after-crash, ledger tamper detection, deadlock handling, priority ordering).
+
 ## Model tier routing (0.5.0)
 
 The bridge routes each dispatch to the right model instead of one-model-fits-all:
