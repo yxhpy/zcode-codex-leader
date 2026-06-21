@@ -674,6 +674,30 @@ function isToolShapedItem(item: any): boolean {
   );
 }
 
+function stringifyStructured(value: any): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+
+function extractAssistantTextFromItem(item: any): string | null {
+  if (!item || item.type === "userMessage" || item.role === "user") return null;
+  if (typeof item.text === "string" && item.text.trim()) return item.text;
+  if (typeof item.output_text === "string" && item.output_text.trim()) return item.output_text;
+  if (typeof item.finalText === "string" && item.finalText.trim()) return item.finalText;
+  if (Array.isArray(item.content)) {
+    const parts = item.content
+      .map((part: any) => typeof part?.text === "string" ? part.text : (typeof part?.output_text === "string" ? part.output_text : ""))
+      .filter((text: string) => text.trim().length > 0);
+    if (parts.length > 0) return parts.join("\n");
+  }
+  const type = String(item.type || "").toLowerCase();
+  if (type.includes("structured") || type.includes("output") || type.includes("final")) {
+    return stringifyStructured(item.output ?? item.value ?? item.result ?? item.data ?? item.content);
+  }
+  return null;
+}
+
 
 async function rpcTurn(
   client: AppServerClient,
@@ -766,6 +790,7 @@ async function runTurnOnState(
     const messages: string[] = [];
     const imageGeneration: Array<{ status: string; result: string; savedPath?: string }> = [];
     const rawItems: any[] = [];
+    const seenItemIds = new Set<string>();
     let done = false;
     let lastToolCompletionAt = 0;
     let workerDied = false;
@@ -811,6 +836,28 @@ async function runTurnOnState(
         postToolTimer.unref?.();
       };
 
+      const collectItem = (item: any) => {
+        const itemKey = item?.id ? String(item.id) : "";
+        if (itemKey && seenItemIds.has(itemKey)) return;
+        if (itemKey) seenItemIds.add(itemKey);
+        rawItems.push(item);
+        const text = extractAssistantTextFromItem(item);
+        if (text) {
+          messages.push(text);
+        }
+        if (item?.type === "imageGeneration") {
+          imageGeneration.push({
+            status: item.status,
+            result: item.result || "",
+            savedPath: item.savedPath || undefined,
+          });
+        }
+        if (isToolShapedItem(item)) {
+          lastToolCompletionAt = Date.now();
+          armPostToolQuiet();
+        }
+      };
+
       client.onNotification((m) => {
         const now = Date.now();
         const currentEpoch = readSession()?.workerEpoch ?? turnEpoch;
@@ -821,22 +868,16 @@ async function runTurnOnState(
         }
         lastNotificationAt = now;
         if (m.method === "item/completed") {
-          const item = m.params?.item || {};
-          rawItems.push(item);
-          if (item.type === "agentMessage" && typeof item.text === "string") {
-            messages.push(item.text);
-          } else if (item.type === "imageGeneration") {
-            imageGeneration.push({
-              status: item.status,
-              result: item.result || "",
-              savedPath: item.savedPath || undefined,
-            });
-          }
-          if (isToolShapedItem(item)) {
-            lastToolCompletionAt = now;
-            armPostToolQuiet();
-          }
+          collectItem(m.params?.item || {});
         } else if (m.method === "turn/completed") {
+          const turn = m.params?.turn || {};
+          rawItems.push({ type: "turnCompleted", turn });
+          if (Array.isArray(turn.items)) {
+            for (const item of turn.items) collectItem(item);
+          } else {
+            const text = extractAssistantTextFromItem(turn);
+            if (text) messages.push(text);
+          }
           done = true;
           finish("turn/completed");
         }

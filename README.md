@@ -15,14 +15,16 @@ Calling `codex` as a CLI per task is slow (tens of seconds of cold start each ti
 
 | Capability | Bridge command | How it works |
 |------------|----------------|--------------|
-| Code generation / parsing | `ask <prompt>` | `turn/start` with text input; optional `--output-schema` constrains structured output |
+| Bridge-controlled implementation | `auto --request-file <file>` | One compact ZCode call; Codex implements/tests/reviews and writes structured result JSON to an artifact |
+| Code generation / parsing | `ask <prompt>` | `turn/start` with text input; optional `--output-schema` constrains structured output; stdout is compact by default (`RESULT_FILE` + summary) |
 | Code grounded in an image | `ask <prompt> --image <path>` | `turn/start` with `localImage` + text input |
 | Visual understanding | `vision <image-path> <question>` | `turn/start` with `localImage` (detail: high) + question |
 | Image generation | `generate-image <prompt> [--out <path>]` | `turn/start`; captures `imageGeneration` item, saves base64 PNG |
-| Test execution (sandboxed) | `test <prompt> [-- <cmd>] [--browser]` | One-shot worker with workspace-write sandbox (+optional browser); runs tests in isolation |
+| Test execution (sandboxed/model-assisted) | `test <prompt> [-- <cmd>] [--browser]` | One-shot worker with workspace-write sandbox (+optional browser); runs tests in isolation |
+| Deterministic local command | `exec -- <cmd>` | Direct build/test/install/git/cache/deploy runner, no LLM tokens; full logs go to `RESULT_FILE` |
 | MCP tool direct call | `mcp-tool <server> <tool> [--args <json>]` | `mcpServer/tool/call` (bypasses a turn) |
 
-Measured on a MacBook (gpt-5.5): handshake 17ms, code turn ~11s, vision ~11s, image generation ~21s, producing a real 1254×1254 PNG.
+Measured on a MacBook (gpt-5.5): handshake 17ms, code turn ~11s, vision ~11s, image generation ~21s, producing a real 1254×1254 PNG. To protect ZCode main-token usage, substantive bridge commands now write full output to artifacts and print only `RESULT_FILE:<path>`, a <=120-word `SUMMARY:`, and `Plugin evidence:` by default (`--print-full` is debug-only).
 Resilience (0.5.0): resident thread reuse (no per-dispatch cold start), wedge watchdog (90s post-tool quiet -> interrupt, vs old 5min blind wait), OAuth failure classification.
 Worker lifecycle hardening (0.6.0): closes the dual-process blind spot where a half-dead worker (node launcher pid A dead, codex binary pid B still serving WS) was reused and hung `turn/start` for the full 120s RPC ceiling. Now `ensureServer` pre-checks pid A liveness before trusting the WS, RPC timeouts are per-method (turn/start 12s, default 60s), a `turn/start` timeout raises `WorkerStaleError` which `runTurn` turns into an automatic kill + restart + single retry (turn done turns a hard 120s hang into ~5s self-heal). Orphaned workers from crashed sessions are reaped on `SessionStart` and on every reconnect via a ppid-chain fingerprint match. Turn completion switched from `while()+sleep()` polling to event-driven (`turn/completed` / WS close / post-tool-quiet / parent-pid-gone / ceiling, first wins), mirroring the official codex-plugin-cc `captureTurn` model.
 Approval-hang fix (0.6.1): the resident worker previously inherited codex's default approval policy, so any dispatch that ran a dangerous shell op (`rm`, `mv`, network) blocked forever in app-server mode — there is no TTY and no human to answer the approval prompt, so `turn/start` hung until the RPC ceiling and the whole dispatch timed out. This is the actual root cause behind the "second turn hangs" reports: the first turn (e.g. a probe) returned text-only, but any follow-up that touched the filesystem with a destructive command wedged. Now `workerArgs` passes `approval_policy=never` + `sandbox_mode=workspace-write` explicitly via `-c`, which is required because codex has a known bug ([openai/codex#27617](https://github.com/openai/codex/issues/27617)) where `approval_policy` in `config.toml` is ignored unless set on the command line. Verified: `rm -f probe.txt` + `apply_patch ADD` now returns DONE in ~10s instead of hanging.
@@ -133,13 +135,16 @@ After install, the next Codex/ZCode session automatically:
 Once installed, ZCode operates in a strict dispatch loop:
 
 1. **Decompose** the request into bounded packets (objective, allowed paths, do/do-not, evidence, stop condition).
-2. **Dispatch** each packet via `codex_bridge.ts`:
+2. **Dispatch** via `codex_bridge.ts` (prefer one compact `auto` call for normal implementation):
    ```bash
+   node --experimental-strip-types "$PLUGIN_ROOT/scripts/codex_bridge.ts" auto --request-file /tmp/request.md
+   # or a lower-level packet:
    node --experimental-strip-types "$PLUGIN_ROOT/scripts/codex_bridge.ts" ask "write a Python merge sort"
    ```
-3. **Ingest & judge** each result — accept, reject, or mark stale.
-4. **Verify** the final state with read-only checks.
-5. **Report** with a `Plugin evidence:` line per dispatched capability (copied from the bridge output).
+3. **Use deterministic `exec` for commands** like build/test/install/git/cache when no model reasoning is needed; use `--external --approved` only after user approval for deploy/push/paid/external side effects.
+4. **Ingest & judge** each compact result — accept, reject, or mark stale. Read the `RESULT_FILE` artifact only when needed for verification.
+5. **Verify** the final state with read-only checks.
+6. **Report** with a `Plugin evidence:` line per dispatched capability (copied from the bridge output).
 
 Trying to `Edit`/`Write`/`rm`/`git commit` directly hits the gate:
 ```

@@ -2,7 +2,10 @@
 // codex_bridge.ts — ZCode's only legal channel for doing implementation work.
 //
 // Subcommands:
-//   ask <prompt> [--image <path>] [--model <m>] [--output-schema <file>] [--effort <e>] [--tier <fast|balanced|strong>] [--task-kind <type>]
+//   auto --request-file <file> [--out <result.json>] [--tier <fast|balanced|strong>] [--mode auto|review]
+//       Preferred low-main-token implementation path. Codex implements/tests/reviews
+//       and stdout stays compact: RESULT_FILE + SUMMARY + Plugin evidence.
+//   ask <prompt> [--out <path>] [--print-full] [--image <path>] [--model <m>] [--output-schema <file>] [--effort <e>] [--tier <fast|balanced|strong>] [--task-kind <type>]
 //       Code generation / parsing. Optional local image, model, reasoning effort,
 //       and JSON-Schema-constrained structured output.
 //   ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
@@ -20,6 +23,9 @@
 //       Run a test suite in an isolated one-shot worker with sandbox (+optional browser).
 //   mcp-tool <server> <tool> [--args <json>] [--thread]
 //       Direct MCP tool call (bypasses a turn).
+//   exec [--timeout <sec>] [--out <log>] [--cwd <dir>] [--full-access] [--external --approved] -- <command...>
+//       Deterministic local command runner for build/test/install/git/cache/deploy work.
+//       No LLM tokens; full log goes to artifact; stdout stays compact.
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
 //       Dispatch a task to the local Antigravity CLI (agy) — long-context,
 //       multimodal, live web.
@@ -32,7 +38,7 @@
 // Each successful call bumps the session dispatch count and prints a trailing
 // "Plugin evidence:" line so ZCode can aggregate evidence for the Stop gate.
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
@@ -88,6 +94,45 @@ function readJsonFile(p: string): any {
   if (!existsSync(p)) fail(`file not found: ${p}`);
   try { return JSON.parse(readFileSync(p, "utf8")); }
   catch { fail(`invalid JSON in ${p}`); }
+}
+
+const COMPACT_SUMMARY_WORDS = 120;
+
+function shouldPrintFull(flags: Record<string, string>): boolean {
+  return flags["print-full"] === "true" || flags.stdout === "full";
+}
+
+function summarizeText(text: string, maxWords = COMPACT_SUMMARY_WORDS): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "(no output)";
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.summary === "string" && parsed.summary.trim()) {
+      return parsed.summary.replace(/\s+/g, " ").trim().split(" ").slice(0, maxWords).join(" ");
+    }
+  } catch { /* not JSON */ }
+  return normalized.split(" ").slice(0, maxWords).join(" ");
+}
+
+function compactArtifactPath(kind: string, flags: Record<string, string>, ext = "txt"): string {
+  if (flags.out) return flags.out;
+  const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return path.join(pluginDataDir(), `${kind}-${suffix}.${ext}`);
+}
+
+function writeCompactOutput(kind: string, text: string, flags: Record<string, string>, evidenceLine: string, ext = "txt"): void {
+  const body = text || "(no output)";
+  if (shouldPrintFull(flags)) {
+    process.stdout.write(body + (body.endsWith("\n") ? "" : "\n"));
+    process.stdout.write(evidenceLine + "\n");
+    return;
+  }
+  const outPath = compactArtifactPath(kind, flags, ext);
+  mkdirSync(path.dirname(outPath), { recursive: true });
+  writeFileSync(outPath, body, "utf8");
+  process.stdout.write(`RESULT_FILE:${outPath}\n`);
+  process.stdout.write(`SUMMARY:${summarizeText(body)}\n`);
+  process.stdout.write(evidenceLine + "\n");
 }
 
 function resolveAgyBin(): string {
@@ -149,9 +194,9 @@ async function cmdAsk(positional: string[], flags: Record<string, string>): Prom
 
   const r = await runTurn(input, opts);
   bumpDispatch();
-  // print agent messages (the actual answer)
-  for (const m of r.messages) process.stdout.write(m + "\n");
-  process.stdout.write(`Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""}\n`);
+  const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
+  const evidence = `Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""}`;
+  writeCompactOutput("ask-result", text, flags, evidence);
 }
 
 // parse: read a source file and answer a question about it. Replaces the leader
@@ -176,16 +221,8 @@ async function cmdParse(positional: string[], flags: Record<string, string>): Pr
   const r = await runTurn(input, opts);
   bumpDispatch();
   const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
-  if (text.length > 800 || flags.out) {
-    const outPath = flags.out || path.join(pluginDataDir(), `parse-${Date.now()}.txt`);
-    writeFileSync(outPath, text, "utf8");
-    const summary = text.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
-    process.stdout.write(outPath + "\n");
-    process.stdout.write((summary || text) + "\n");
-  } else {
-    process.stdout.write(text + "\n");
-  }
-  process.stdout.write(`Plugin evidence: parse via codex_bridge.ts — turn ${r.turnId} on ${filePath}${r.tier ? " [tier=" + r.tier + "]" : ""}\n`);
+  const evidence = `Plugin evidence: parse via codex_bridge.ts — turn ${r.turnId} on ${filePath}${r.tier ? " [tier=" + r.tier + "]" : ""}`;
+  writeCompactOutput("parse-result", text, flags, evidence);
 }
 
 // web: web research via the resident worker's webSearch capability. The leader's
@@ -206,16 +243,8 @@ async function cmdWeb(positional: string[], flags: Record<string, string>): Prom
   const r = await runTurn(input, opts);
   bumpDispatch();
   const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
-  if (text.length > 800 || flags.out) {
-    const outPath = flags.out || path.join(pluginDataDir(), `web-${Date.now()}.txt`);
-    writeFileSync(outPath, text, "utf8");
-    const summary = text.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
-    process.stdout.write(outPath + "\n");
-    process.stdout.write((summary || text) + "\n");
-  } else {
-    process.stdout.write(text + "\n");
-  }
-  process.stdout.write(`Plugin evidence: web via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + "]" : ""}\n`);
+  const evidence = `Plugin evidence: web via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + "]" : ""}`;
+  writeCompactOutput("web-result", text, flags, evidence);
 }
 
 // ask-file: code generation / parsing with file-based prompt and result output
@@ -238,12 +267,9 @@ async function cmdAskFile(positional: string[], flags: Record<string, string>): 
 
   const r = await runTurn(input, opts);
   bumpDispatch();
-  const dir = pluginDataDir();
-  const outPath = flags.out || path.join(dir, `result-${Date.now()}.txt`);
   const resultText = r.messages.length > 0 ? r.messages.join("\n") : "(no agentMessage text returned)";
-  writeFileSync(outPath, resultText, "utf8");
-  process.stdout.write(outPath + "\n");
-  process.stdout.write(`Plugin evidence: ask-file via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""} → ${outPath}\n`);
+  const evidence = `Plugin evidence: ask-file via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""}`;
+  writeCompactOutput("ask-file-result", resultText, flags, evidence);
 }
 
 // vision: visual understanding of a local image
@@ -258,8 +284,8 @@ async function cmdVision(positional: string[], flags: Record<string, string>): P
   ];
   const r = await runTurn(input);
   bumpDispatch();
-  for (const m of r.messages) process.stdout.write(m + "\n");
-  process.stdout.write(`Plugin evidence: vision via codex_bridge.ts — turn ${r.turnId}\n`);
+  const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
+  writeCompactOutput("vision-result", text, flags, `Plugin evidence: vision via codex_bridge.ts — turn ${r.turnId}`);
 }
 
 // generate-image: synchronous image generation via a dedicated one-shot image worker.
@@ -328,17 +354,8 @@ async function cmdTest(positional: string[], flags: Record<string, string>): Pro
   const r = await runTestTurn(input, opts);
   bumpDispatch();
 
-  const messages = r.messages.join("\n");
-  if (messages.length > 800 || flags.out) {
-    const outPath = flags.out || path.join(pluginDataDir(), `test-result-${Date.now()}.txt`);
-    writeFileSync(outPath, messages || "(no agentMessage text returned)", "utf8");
-    const summary = messages.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
-    process.stdout.write(outPath + "\n");
-    process.stdout.write((summary || "(no agentMessage text returned)") + "\n");
-  } else {
-    process.stdout.write(messages + (messages ? "\n" : ""));
-  }
-  process.stdout.write(`Plugin evidence: test via codex_bridge.ts — turn ${r.turnId} [browser=${opts.browser ? "on" : "off"}]\n`);
+  const messages = r.messages.join("\n") || "(no agentMessage text returned)";
+  writeCompactOutput("test-result", messages, flags, `Plugin evidence: test via codex_bridge.ts — turn ${r.turnId} [browser=${opts.browser ? "on" : "off"}]`);
 }
 
 // mcp-tool: direct MCP tool call (bypasses a turn)
@@ -353,8 +370,7 @@ async function cmdMcpTool(positional: string[], flags: Record<string, string>): 
   const useThread = flags.thread === "true";
   const result = await callMcpTool(server, tool, args, useThread);
   bumpDispatch();
-  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
-  process.stdout.write(`Plugin evidence: mcp-tool via codex_bridge.ts — ${server}/${tool}\n`);
+  writeCompactOutput("mcp-tool-result", JSON.stringify(result, null, 2), flags, `Plugin evidence: mcp-tool via codex_bridge.ts — ${server}/${tool}`, "json");
 }
 
 // agy: dispatch to local Antigravity CLI
@@ -415,8 +431,8 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
     fail(`agy exited with code ${code}`);
   }
 
-  process.stdout.write(Buffer.concat(stdout));
-  process.stdout.write("Plugin evidence: agy via codex_bridge.ts — exit 0\n");
+  const text = Buffer.concat(stdout).toString() || "(no agy stdout)";
+  writeCompactOutput("agy-result", text, flags, "Plugin evidence: agy via codex_bridge.ts — exit 0");
   bumpDispatch();
 }
 
@@ -433,7 +449,8 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     const url = flags.url;
     if (url) args.push("--url", url);
     if (flags.timeout) args.push("--timeout", flags.timeout);
-    if (flags.out) args.push("--out", flags.out);
+    const outPath = flags.out || (shouldPrintFull(flags) ? undefined : compactArtifactPath("gpt-pro-result", {}, "txt"));
+    if (outPath) args.push("--out", outPath);
   } else if (command === "ask") {
     const prompt = positional[1];
     const promptFile = flags["prompt-file"];
@@ -447,7 +464,8 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
       else args.push("ask");
     }
     for (const filePath of filePaths) args.push("--file", filePath);
-    if (flags.out) args.push("--out", flags.out);
+    const outPath = flags.out || (shouldPrintFull(flags) ? undefined : compactArtifactPath("gpt-pro-result", {}, "txt"));
+    if (outPath) args.push("--out", outPath);
     if (flags.timeout) args.push("--timeout", flags.timeout);
     if (flags.force) args.push("--force");
   } else {
@@ -505,9 +523,233 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     fail(`gpt-pro exited with code ${code}`);
   }
 
-  process.stdout.write(Buffer.concat(stdout));
+  const childOut = Buffer.concat(stdout).toString();
+  process.stdout.write(childOut);
+  const resultMatch = childOut.match(/^RESULT_FILE:(.+)$/m);
+  if (resultMatch && !/^SUMMARY:/m.test(childOut)) {
+    const resultPath = resultMatch[1].trim();
+    if (existsSync(resultPath)) {
+      process.stdout.write(`SUMMARY:${summarizeText(readFileSync(resultPath, "utf8"))}\n`);
+    }
+  }
   process.stdout.write("Plugin evidence: gpt-pro via codex_bridge.ts — exit 0\n");
   bumpDispatch();
+}
+
+function shellQuoteForDisplay(argv: string[]): string {
+  return argv.map((arg) => /^[A-Za-z0-9_./:=@%+-]+$/.test(arg) ? arg : JSON.stringify(arg)).join(" ");
+}
+
+function appendTail(current: string, chunk: string, maxChars = 80_000): string {
+  const next = current + chunk;
+  return next.length > maxChars ? next.slice(-maxChars) : next;
+}
+
+function signalProcessTree(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) return;
+  try { process.kill(-pid, signal); } catch {}
+  try { process.kill(pid, signal); } catch {}
+}
+
+function shellPayload(command: string[]): string | null {
+  const base = path.basename(command[0] || "");
+  if (!["sh", "bash", "zsh", "fish", "dash"].includes(base)) return null;
+  for (let i = 1; i < command.length - 1; i += 1) {
+    const arg = command[i];
+    if (arg === "-c" || (/^-/.test(arg) && arg.includes("c"))) return command[i + 1];
+  }
+  return null;
+}
+
+function shellPayloadNeedsExternalApproval(payload: string): string | null {
+  if (/\bgit(?:\s+(?!&&|\|\||;)\S+)*\s+push\b/i.test(payload)) return "shell git push";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+publish\b/i.test(payload)) return "shell package publish";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+run\s+[^;&|]*\b(?:deploy|release|publish)\b/i.test(payload)) return "shell package deploy/release";
+  if (/\b(?:wrangler|vercel|netlify|firebase|fly|railway)\b[^;&|]*\b(?:deploy|publish|release|push|up|--prod)\b/i.test(payload)) return "shell external deploy";
+  if (/\bdocker\s+push\b/i.test(payload)) return "shell docker push";
+  if (/\bgh\s+release\s+(?:create|upload|delete)\b/i.test(payload)) return "shell gh release";
+  if (/\bkubectl\s+(?:apply|delete|patch|replace|rollout|scale)\b/i.test(payload)) return "shell kubectl mutation";
+  if (/\b(?:aws|gcloud|az)\b/i.test(payload) && !/\b(?:help|--help|version|--version)\b/i.test(payload)) return "shell cloud command";
+  if (/\b(?:curl|http|httpie)\b[\s\S]*\b(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)\b/i.test(payload)) return "shell mutating HTTP request";
+  return null;
+}
+
+function commandNeedsExternalApproval(command: string[]): string | null {
+  const payload = shellPayload(command);
+  if (payload) {
+    const shellReason = shellPayloadNeedsExternalApproval(payload);
+    if (shellReason) return shellReason;
+  }
+  const base = path.basename(command[0] || "");
+  const args = command.slice(1).map((arg) => arg.toLowerCase());
+  const joined = [base.toLowerCase(), ...args].join(" ");
+  if (base === "git" && args.includes("push")) return "git push";
+  if (["npm", "pnpm", "yarn", "bun"].includes(base) && args.includes("publish")) return `${base} publish`;
+  if (["npm", "pnpm", "yarn", "bun"].includes(base) && args[0] === "run" && /(^|:)(deploy|release|publish)(:|$)/i.test(args[1] || "")) return `${base} run ${args[1]}`;
+  if (["wrangler", "vercel", "netlify", "firebase", "fly", "railway"].includes(base) && /(deploy|publish|release|push|up|--prod)/.test(joined)) return `${base} external deploy`;
+  if (base === "docker" && args[0] === "push") return "docker push";
+  if (base === "gh" && args[0] === "release" && ["create", "upload", "delete"].includes(args[1] || "")) return `gh release ${args[1]}`;
+  if (base === "kubectl" && ["apply", "delete", "patch", "replace", "rollout", "scale"].includes(args[0] || "")) return `kubectl ${args[0]}`;
+  if (["aws", "gcloud", "az"].includes(base) && !args.some((arg) => ["--help", "help", "version", "--version"].includes(arg))) return `${base} cloud command`;
+  if (["curl", "http", "httpie"].includes(base) && /\s(-x|--request)\s*(post|put|patch|delete)\b/i.test(joined)) return `${base} mutating HTTP request`;
+  return null;
+}
+
+// exec: deterministic local command runner. No LLM/token use; intended for
+// build/test/install/git/cache/deploy commands that the worker sandbox cannot run.
+async function cmdExec(args: string[]): Promise<number> {
+  const separatorIndex = args.indexOf("--");
+  if (separatorIndex === -1) fail("exec requires -- <command...>", 2);
+  const parsed = parseFlags(args.slice(0, separatorIndex), {
+    timeout: "string",
+    out: "string",
+    cwd: "string",
+    "full-access": "boolean",
+    external: "boolean",
+    approved: "boolean",
+  });
+  const command = args.slice(separatorIndex + 1);
+  if (command.length === 0) fail("exec requires a command after --", 2);
+  const externalReason = commandNeedsExternalApproval(command);
+  const isExternal = parsed.flags.external === true || externalReason !== null;
+  if (isExternal && (parsed.flags.external !== true || parsed.flags.approved !== true)) {
+    fail(`exec external side effect requires --external --approved (ask the user first): ${externalReason || "explicit --external"}`, 2);
+  }
+
+  const timeoutSec = parsed.flags.timeout === undefined ? 600 : Number(parsed.flags.timeout);
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) fail(`invalid --timeout: ${String(parsed.flags.timeout)}`, 2);
+  const cwd = typeof parsed.flags.cwd === "string" ? path.resolve(parsed.flags.cwd) : process.cwd();
+  if (!existsSync(cwd)) fail(`exec cwd does not exist: ${cwd}`, 2);
+
+  const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : compactArtifactPath("exec-log", {}, "log");
+  mkdirSync(path.dirname(outPath), { recursive: true });
+  const display = shellQuoteForDisplay(command);
+  const startedAt = Date.now();
+  const log = createWriteStream(outPath, { flags: "w" });
+  log.write(`# codex_bridge exec\ncommand: ${display}\ncwd: ${cwd}\nfull_access: ${parsed.flags["full-access"] === true}\nexternal: ${isExternal}\nexternal_reason: ${externalReason || ""}\ntimeout_sec: ${timeoutSec}\nstarted_at: ${new Date(startedAt).toISOString()}\n\n## stdout/stderr\n`);
+
+  let tail = "";
+  let timedOut = false;
+  let spawnError: Error | null = null;
+  const child = spawn(command[0], command.slice(1), {
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd,
+    env: process.env,
+    shell: false,
+    detached: true,
+  });
+
+  const writeChunk = (streamName: "stdout" | "stderr", chunk: Buffer) => {
+    const text = chunk.toString();
+    log.write(`\n### ${streamName}\n${text}`);
+    tail = appendTail(tail, `[${streamName}] ${text}`);
+  };
+  child.stdout.on("data", (chunk: Buffer) => writeChunk("stdout", chunk));
+  child.stderr.on("data", (chunk: Buffer) => writeChunk("stderr", chunk));
+
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      signalProcessTree(child.pid, "SIGTERM");
+      setTimeout(() => signalProcessTree(child.pid, "SIGKILL"), 2000).unref?.();
+    }, Math.round(timeoutSec * 1000));
+    timer.unref?.();
+    child.on("error", (e) => {
+      spawnError = e;
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+
+  const durationMs = Date.now() - startedAt;
+  const exitCode = spawnError ? 127 : timedOut ? 124 : (result.code ?? (result.signal ? 128 : 1));
+  const status = exitCode === 0 ? "passed" : "failed";
+  log.write(`\n\n## result\nstatus: ${status}\nexit_code: ${exitCode}\nsignal: ${result.signal || ""}\ntimed_out: ${timedOut}\nduration_ms: ${durationMs}\nended_at: ${new Date().toISOString()}\n`);
+  if (spawnError) log.write(`spawn_error: ${spawnError.message}\n`);
+  await new Promise<void>((resolve) => log.end(resolve));
+
+  const tailSummary = summarizeText(tail || (spawnError?.message ?? "no output"), 60);
+  process.stdout.write(`RESULT_FILE:${outPath}\n`);
+  process.stdout.write(`SUMMARY:exec ${status} exit=${exitCode} duration=${Math.round(durationMs / 1000)}s cmd=${display}${tailSummary ? ` — ${tailSummary}` : ""}\n`);
+  process.stdout.write(`Plugin evidence: exec via codex_bridge.ts — exit ${exitCode} → ${outPath}\n`);
+  bumpDispatch();
+  return exitCode === 0 ? 0 : exitCode;
+}
+
+// auto: one-shot bridge-controlled run. ZCode sends one request file; the bridge
+// keeps details in artifacts and returns only RESULT_FILE + SUMMARY + evidence.
+async function cmdAuto(args: string[]): Promise<void> {
+  const parsed = parseFlags(args, {
+    "request-file": "string",
+    out: "string",
+    tier: "string",
+    mode: "string",
+    "print-full": "boolean",
+  });
+  const requestFile = (typeof parsed.flags["request-file"] === "string" ? parsed.flags["request-file"] : undefined) || parsed.positional[0];
+  if (!requestFile) fail("auto requires --request-file <file> (or positional request file)", 2);
+  if (!existsSync(requestFile)) fail(`auto request file not found: ${requestFile}`, 2);
+
+  const runId = "run_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const runDir = path.join(pluginDataDir(), "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+  const request = readFileSync(requestFile, "utf8").trim();
+  const savedRequest = path.join(runDir, "request.md");
+  writeFileSync(savedRequest, request, "utf8");
+
+  const resultPath = typeof parsed.flags.out === "string" ? parsed.flags.out : path.join(runDir, "result.json");
+  const tier = typeof parsed.flags.tier === "string" ? parsed.flags.tier : "balanced";
+  const mode = typeof parsed.flags.mode === "string" ? parsed.flags.mode : "auto";
+  const resultSchema = readJsonFile(new URL("./schemas/result-v1.schema.json", import.meta.url).pathname);
+  const attemptId = "att_auto";
+  const prompt = `You are the Codex worker for zcode-codex-leader auto mode. Complete the request end-to-end with high quality while keeping ZCode's main context tiny.
+
+Run metadata:
+- run_id: ${runId}
+- packet_id: pkt_auto
+- attempt_id: ${attemptId}
+- mode: ${mode}
+- request_ref: ${savedRequest}
+
+Rules:
+1. You may inspect and edit the current workspace as needed for the request.
+2. Prefer the smallest correct change. Avoid unrelated refactors.
+3. Run relevant tests or explain why they were skipped.
+4. Do not dump long logs in your final answer. Save/mention artifact paths if needed.
+5. Your final answer MUST be strict JSON matching the provided result schema. Use run_id=${runId}, packet_id=pkt_auto, attempt_id=${attemptId}.
+
+User request:
+${request}`;
+
+  const r = await runTurn([{ type: "text", text: prompt }], {
+    tier,
+    taskKind: mode === "review" ? "review" : "codegen",
+    outputSchema: resultSchema,
+  });
+  bumpDispatch();
+
+  const resultText = r.messages.join("\n").trim() || JSON.stringify({
+    schema_version: "1",
+    run_id: runId,
+    packet_id: "pkt_auto",
+    attempt_id: attemptId,
+    status: "failed",
+    summary: "No agentMessage text returned",
+    files_changed: [],
+    tests: [],
+    artifacts: [],
+    risks: [],
+    blockers: ["no agentMessage text returned"],
+    evidence: [],
+    suggested_packets: [],
+  }, null, 2);
+
+  const compactFlags: Record<string, string> = { out: resultPath };
+  if (parsed.flags["print-full"] === true) compactFlags["print-full"] = "true";
+  const evidence = `Plugin evidence: auto via codex_bridge.ts — turn ${r.turnId} [run=${runId},tier=${r.tier || tier}]`;
+  writeCompactOutput("auto-result", resultText, compactFlags, evidence, "json");
 }
 
 // Generate a candidate DAG plan by dispatching a read-only planner packet to the worker.
@@ -532,9 +774,9 @@ async function cmdPlan(args: string[]): Promise<void> {
     "write_globs",
     "base_revision",
   ] satisfies Array<keyof PacketInput>;
-  const prompt = "You are a planner. Read the request and decompose it into a dependency-ordered DAG of bounded packets. Return strict JSON matching the output schema. Each packet has: " + packetFields[0] + " (pkt_<n>), " + packetFields[1] + " (omit, filled by caller), " + packetFields[2] + ", " + packetFields[3] + ", " + packetFields[4] + " (one sentence), " + packetFields[5] + " (packet_ids), " + packetFields[6] + " (int), " + packetFields[7] + " (string[]), " + packetFields[8] + " (\"HEAD\"). Only split when there are real dependencies or parallelism benefit; otherwise return a single packet. Max 8 packets. Request:\n" + request;
-  const schemaPath = new URL("./schemas/packet-v1.schema.json", import.meta.url);
-  // planner uses output-schema to force JSON array of packets
+  const prompt = "You are a planner. Read the request and decompose it into a dependency-ordered DAG of bounded packets. Return strict JSON matching the output schema: {schema_version:'1', packets:[...]}. Each packet has: " + packetFields[0] + " (pkt_<n>), " + packetFields[1] + " (omit, filled by caller), " + packetFields[2] + ", " + packetFields[3] + ", " + packetFields[4] + " (one sentence), " + packetFields[5] + " (packet_ids), " + packetFields[6] + " (int), " + packetFields[7] + " (string[]), " + packetFields[8] + " (\"HEAD\"). Only split when there are real dependencies or parallelism benefit; otherwise return a single packet. Max 8 packets. Request:\n" + request;
+  const schemaPath = new URL("./schemas/plan-v1.schema.json", import.meta.url);
+  // planner uses output-schema to force a compact plan object with packets[]
   const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : undefined;
   const tier = typeof parsed.flags.tier === "string" ? parsed.flags.tier : "strong";
   // delegate to existing ask machinery with output-schema
@@ -544,8 +786,8 @@ async function cmdPlan(args: string[]): Promise<void> {
   // Simpler: spawn this same bridge with 'ask' subcommand.
   const child = spawn(process.execPath, [process.argv[1], "ask", ...askArgs], { stdio: "inherit" });
   const code = await new Promise<number>((resolve) => child.on("exit", (exitCode) => resolve(exitCode ?? 1)));
-  console.log("Plugin evidence: plan via codex_bridge.ts — delegated to ask with output-schema");
   if (code !== 0) process.exit(code);
+  console.log("Plugin evidence: plan via codex_bridge.ts — delegated to ask with output-schema");
 }
 
 // Print run status from the SQLite store. Compact stdout by default, full JSON with --json.
@@ -712,6 +954,8 @@ async function main(): Promise<void> {
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "test":           return cmdTest(positional, flags);
     case "mcp-tool":       return cmdMcpTool(positional, flags);
+    case "exec":           process.exit(await cmdExec(rawArgsAfterSubcommand("exec")));
+    case "auto":           return cmdAuto(rawArgsAfterSubcommand("auto"));
     case "plan":           return cmdPlan(rawArgsAfterSubcommand("plan"));
     case "status":         return cmdStatus(rawArgsAfterSubcommand("status"));
     case "run":            process.exit(await cmdRun(rawArgsAfterSubcommand("run")));
@@ -732,24 +976,29 @@ async function main(): Promise<void> {
 const USAGE = `codex_bridge — ZCode's leader-only dispatch channel to the resident codex app-server worker.
 
 Usage:
-  codex_bridge ask <prompt> [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
-  codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
-      Like ask, but reads the prompt from a file and writes the full result to a file. stdout shows only the result path + evidence. Saves leader context tokens.
-  codex_bridge parse <file> [question] [--out <path>] [--tier <t>] [--model <m>] [--effort <e>]
+  codex_bridge ask <prompt> [--out <path>] [--print-full] [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
+      Writes full worker output to RESULT_FILE by default; stdout shows RESULT_FILE + <=120-word SUMMARY + evidence. Use --print-full only for debugging.
+  codex_bridge ask-file <prompt-file> [--out <result-file>] [--print-full] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
+      Like ask, but reads the prompt from a file. stdout is compact by default. Saves leader context tokens.
+  codex_bridge parse <file> [question] [--out <path>] [--print-full] [--tier <t>] [--model <m>] [--effort <e>]
       Read a source file and answer a question about it. Replaces the leader
       reading code directly. Omit question for a default purpose/exports summary.
-      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
-  codex_bridge web <query> [--out <path>] [--depth 1-5] [--tier <t>] [--model <m>] [--effort <e>]
+      Full output is written to RESULT_FILE by default; stdout shows RESULT_FILE + SUMMARY.
+  codex_bridge web <query> [--out <path>] [--print-full] [--depth 1-5] [--tier <t>] [--model <m>] [--effort <e>]
       Web research via the resident worker's webSearch. Replaces WebSearch/WebFetch.
-      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
-  codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
+      Full output is written to RESULT_FILE by default; stdout shows RESULT_FILE + SUMMARY.
+  codex_bridge vision <image-path> <question> [--out <path>] [--print-full] [--detail auto|low|high|original]
   codex_bridge generate-image <prompt> [--out <path>] [--timeout <sec>]
-  codex_bridge test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]
+  codex_bridge test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--print-full] [--timeout <sec>] [--tier <t>]
       Run a test suite in an isolated one-shot worker with sandbox (+optional browser). Default timeout 600s.
-      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
-  codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true]
-  codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
-      Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web.
+      Full output is written to RESULT_FILE by default; stdout shows RESULT_FILE + SUMMARY.
+  codex_bridge mcp-tool <server> <tool> [--args <json>] [--thread true] [--out <file>] [--print-full]
+  codex_bridge exec [--timeout <sec>] [--out <log>] [--cwd <dir>] [--full-access] [--external --approved] -- <command...>
+      Run a deterministic local command directly (no LLM tokens) for build/test/install/git/cache/deploy work. stdout is compact; full log goes to RESULT_FILE.
+  codex_bridge agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>] [--out <file>] [--print-full]
+      Dispatch a task to the local Antigravity CLI (agy) — long-context, multimodal, live web. stdout is compact by default.
+  codex_bridge auto --request-file <file> [--out <result.json>] [--tier <fast|balanced|strong>] [--mode auto|review] [--print-full]
+      One-shot bridge-controlled run: implement/test/review inside Codex, write full result JSON to artifact, print only RESULT_FILE + SUMMARY + evidence.
   codex_bridge plan <request-file> [--tier <t>] [--out <path>]
       Generate a candidate DAG plan (read-only planner packet).
   codex_bridge status --run <run_id> [--json]
@@ -760,9 +1009,9 @@ Usage:
       Resume an interrupted run.
   codex_bridge resume --run <run_id>
       Alias for 'run --run'.
-  codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
-  codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
-      Resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL.
+  codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>] [--print-full]
+  codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
+      Resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL. If --out is omitted, bridge creates one so stdout stays small.
   codex_bridge gpt-pro status
   codex_bridge gpt-pro help
       Dispatch to ChatGPT web Pro via opencli Browser Bridge.

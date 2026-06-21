@@ -23,19 +23,19 @@ Make ZCode/Codex a pure **leader/owner** that never does substantive implementat
               │                                                 │
    ┌──────────┴──────────┐                          ┌────────────┴──────────┐
    │ leader_hook.ts      │                          │ codex_bridge.ts       │
-   │ (4 hook events)     │                          │ (6 dispatch commands) │
+   │ (4 hook events)     │                          │ (compact dispatch)    │
    ├─────────────────────┤                          ├───────────────────────┤
-   │ session-start:      │                          │ ask                   │
-   │  inject constitution│                          │ vision                │
-   │  + ensureServer     │                          │ generate-image        │
-   │ watchdog:           │                          │ test                  │
-   │  keep worker alive  │                          │ ask-file              │
-   │ pre-tool-use:       │                          │ mcp-tool              │
+   │ session-start:      │                          │ auto                  │
+   │  inject constitution│                          │ ask / ask-file        │
+   │  + ensureServer     │                          │ parse / web / vision  │
+   │ watchdog:           │                          │ generate-image        │
+   │  keep worker alive  │                          │ test / exec / mcp-tool│
+   │ pre-tool-use:       │                          │ agy / gpt-pro         │
    │  block writes,      │                          │ (each bumps           │
    │  allow reads+bridge │                          │  dispatchCount,       │
-   │ user-prompt-submit: │                          │  prints evidence line)│
-   │  append reminder    │                          └───────────────────────┘
-   │ stop:               │
+   │ user-prompt-submit: │                          │  prints RESULT_FILE + │
+   │  append reminder    │                          │  SUMMARY + evidence) │
+   │ stop:               │                          └───────────────────────┘
    │  evidence gate      │
    └─────────────────────┘
 ```

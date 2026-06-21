@@ -21,6 +21,7 @@
   ],
   "properties": {
     "schema_version": {
+      "type": "string",
       "const": "1"
     },
     "run_id": {
@@ -38,7 +39,8 @@
         "failed",
         "blocked",
         "needs_input"
-      ]
+      ],
+      "type": "string"
     },
     "summary": {
       "type": "string",
@@ -59,16 +61,13 @@
             "type": "string"
           },
           "before_sha": {
-            "type": "string",
-            "default": ""
+            "type": "string"
           },
           "after_sha": {
-            "type": "string",
-            "default": ""
+            "type": "string"
           }
         }
-      },
-      "default": []
+      }
     },
     "tests": {
       "type": "array",
@@ -90,18 +89,17 @@
               "passed",
               "failed",
               "skipped"
-            ]
+            ],
+            "type": "string"
           },
           "exit_code": {
             "type": "integer"
           },
           "log_digest": {
-            "type": "string",
-            "default": ""
+            "type": "string"
           }
         }
-      },
-      "default": []
+      }
     },
     "artifacts": {
       "type": "array",
@@ -120,25 +118,23 @@
               "image",
               "log",
               "other"
-            ]
+            ],
+            "type": "string"
           },
           "path": {
             "type": "string"
           },
           "sha256": {
-            "type": "string",
-            "default": ""
+            "type": "string"
           }
         }
-      },
-      "default": []
+      }
     },
     "risks": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "default": [],
       "maxItems": 10
     },
     "blockers": {
@@ -146,7 +142,6 @@
       "items": {
         "type": "string"
       },
-      "default": [],
       "maxItems": 10
     },
     "evidence": {
@@ -166,15 +161,13 @@
             "type": "string"
           }
         }
-      },
-      "default": []
+      }
     },
     "suggested_packets": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "default": [],
       "maxItems": 5
     }
   }

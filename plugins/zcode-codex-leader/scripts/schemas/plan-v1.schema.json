@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-codex-leader/plan-v1.schema.json",
+  "title": "PlanV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "packets"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "packets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "packet_id",
+          "kind",
+          "model_tier",
+          "objective",
+          "depends_on",
+          "priority",
+          "write_globs",
+          "base_revision"
+        ],
+        "properties": {
+          "packet_id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "ask",
+              "parse",
+              "web",
+              "vision",
+              "generate-image",
+              "test",
+              "mcp-tool",
+              "agy",
+              "gpt-pro"
+            ],
+            "type": "string"
+          },
+          "model_tier": {
+            "enum": [
+              "fast",
+              "balanced",
+              "strong"
+            ],
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "write_globs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "base_revision": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

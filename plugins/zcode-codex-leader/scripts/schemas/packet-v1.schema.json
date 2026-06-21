@@ -25,6 +25,7 @@
   ],
   "properties": {
     "schema_version": {
+      "type": "string",
       "const": "1"
     },
     "run_id": {
@@ -35,13 +36,11 @@
     },
     "packet_revision": {
       "type": "integer",
-      "minimum": 1,
-      "default": 1
+      "minimum": 1
     },
     "dag_version": {
       "type": "integer",
-      "minimum": 1,
-      "default": 1
+      "minimum": 1
     },
     "title": {
       "type": "string"
@@ -60,25 +59,25 @@
         "mcp-tool",
         "agy",
         "gpt-pro"
-      ]
+      ],
+      "type": "string"
     },
     "model_tier": {
       "enum": [
         "fast",
         "balanced",
         "strong"
-      ]
+      ],
+      "type": "string"
     },
     "depends_on": {
       "type": "array",
       "items": {
         "type": "string"
-      },
-      "default": []
+      }
     },
     "priority": {
-      "type": "integer",
-      "default": 0
+      "type": "integer"
     },
     "inputs": {
       "type": "object",
@@ -96,15 +95,13 @@
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": []
+          }
         },
         "artifact_refs": {
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": []
+          }
         }
       }
     },
@@ -135,8 +132,7 @@
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": []
+          }
         },
         "base_revision": {
           "type": "string"
@@ -173,7 +169,8 @@
                   "file",
                   "schema",
                   "review"
-                ]
+                ],
+                "type": "string"
               },
               "value": {
                 "type": "string"
@@ -182,8 +179,7 @@
           }
         },
         "output_schema_ref": {
-          "type": "string",
-          "default": ""
+          "type": "string"
         }
       }
     },
@@ -202,16 +198,13 @@
           "minimum": 1000
         },
         "heartbeat_interval_ms": {
-          "type": "integer",
-          "default": 15000
+          "type": "integer"
         },
         "no_progress_timeout_ms": {
-          "type": "integer",
-          "default": 90000
+          "type": "integer"
         },
         "max_turns": {
-          "type": "integer",
-          "default": 10
+          "type": "integer"
         }
       }
     },
@@ -227,27 +220,19 @@
       "properties": {
         "max_attempts": {
           "type": "integer",
-          "minimum": 1,
-          "default": 3
+          "minimum": 1
         },
         "initial_backoff_ms": {
-          "type": "integer",
-          "default": 1000
+          "type": "integer"
         },
         "max_backoff_ms": {
-          "type": "integer",
-          "default": 30000
+          "type": "integer"
         },
         "retry_on": {
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": [
-            "worker_crash",
-            "timeout",
-            "protocol_error"
-          ]
+          }
         }
       }
     },
@@ -267,19 +252,17 @@
             "repo_local",
             "external_idempotent",
             "external_irreversible"
-          ]
+          ],
+          "type": "string"
         },
         "idempotency_key": {
-          "type": "string",
-          "default": ""
+          "type": "string"
         },
         "reconcile_strategy": {
-          "type": "string",
-          "default": ""
+          "type": "string"
         },
         "compensation_packet_id": {
-          "type": "string",
-          "default": ""
+          "type": "string"
         }
       }
     }

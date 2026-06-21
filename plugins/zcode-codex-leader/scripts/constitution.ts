@@ -59,54 +59,66 @@ the web, understand an image, or generate an image is:
   node --experimental-strip-types "${bridge}" <command> ...
 
 Commands:
-  ask <prompt> [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
+  auto --request-file <file> [--out <result.json>] [--tier <fast|balanced|strong>] [--mode auto|review]
+      Preferred low-main-token path for normal implementation tasks. ZCode writes the
+      user request to a file, calls auto once, and receives only RESULT_FILE + SUMMARY
+      + Plugin evidence. Codex performs implement/test/review inside the bridge and
+      writes the full structured result JSON to the artifact path.
+  ask <prompt> [--out <path>] [--print-full] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
       Code generation / parsing. Add --image to ground the answer in a local image.
       Use --output-schema (a JSON Schema file) to force structured/parseable output.
+      stdout is compact by default: RESULT_FILE + <=120-word SUMMARY + evidence.
+      Use --print-full only for debugging.
       --tier selects a model preset (fast=gpt-5.4-mini/low, balanced=gpt-5.5/medium default,
       strong=gpt-5.5/high). --task-kind auto-infers the tier from the task type
       (codegen/review/debug/refactor->strong, explore/parse/qa/summary->fast, else->balanced).
       Explicit --model/--effort always override the tier preset.
-  parse <file> [question] [--out <path>] [--tier <t>]
+  parse <file> [question] [--out <path>] [--print-full] [--tier <t>]
       Read a SOURCE file and answer a question about it. Use this INSTEAD of the
       Read tool on any code file (.ts/.js/.py/.go/.rs/.java/...). Omit question for
-      a default purpose/exports/key-logic summary. Output >800 chars goes to --out;
-      stdout shows the path + a <=200-word summary.
-  web <query> [--out <path>] [--depth 1-5] [--tier <t>]
+      a default purpose/exports/key-logic summary. Full output goes to RESULT_FILE;
+      stdout shows only RESULT_FILE + SUMMARY + evidence.
+  web <query> [--out <path>] [--print-full] [--depth 1-5] [--tier <t>]
       Web research via the resident worker's webSearch. Use this INSTEAD of
-      WebSearch/WebFetch. Cites source URLs. Output >800 chars goes to --out.
-  vision <image-path> <question>
-      Visual understanding of a local image (what does it show?).
+      WebSearch/WebFetch. Cites source URLs. Full output goes to RESULT_FILE.
+  vision <image-path> <question> [--out <path>] [--print-full]
+      Visual understanding of a local image (what does it show?). Full output goes to RESULT_FILE.
   generate-image <prompt> [--out <path>] [--timeout <sec>]
       Synchronous image generation. It starts a dedicated one-shot image worker
       with image generation enabled, waits for the final imageGeneration item,
       writes the PNG, and prints the saved PNG path. The resident codex worker
       still keeps image generation disabled.
-  test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]
+  test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--print-full] [--timeout <sec>] [--tier <t>]
       Run a test suite in an isolated one-shot worker with sandbox enabled
       (workspace-write by default, danger-full-access with --browser). Use --browser
       to enable browser_use + chrome plugin for e2e tests. Default timeout 600s.
-      Output >800 chars is written to a file; stdout shows the path + summary.
+      Full output goes to RESULT_FILE by default; stdout shows RESULT_FILE + SUMMARY + evidence.
       The resident worker stays clean - test runs in a separate ephemeral worker.
   mcp-tool <server> <tool> [--args <json>] [--thread true]
       Direct MCP tool call without a full turn.
+  exec [--timeout <sec>] [--out <log>] [--cwd <dir>] [--full-access] [--external --approved] -- <command...>
+      Deterministic local command runner for build/test/install/git/cache/deploy work that the
+      sandboxed worker cannot perform. Uses NO LLM tokens. Full log goes to RESULT_FILE;
+      stdout shows RESULT_FILE + SUMMARY + evidence. For deploy/push/paid/external side effects,
+      ask the user first, then pass --external --approved.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch to local Antigravity CLI (agy) for long-context / multimodal / live-web work.
-  gpt-pro ask <prompt> [--out <file>] [--timeout <sec>]
+  gpt-pro ask <prompt> [--out <file>] [--timeout <sec>] [--print-full]
       Dispatch a hard code review or deep question to ChatGPT web (Pro model) via
       the opencli Browser Bridge. gpt-pro status checks Bridge / login / Pro tier.
       Default --timeout is 900s; if the Pro model is still actively generating
       when the timeout hits, the deadline auto-extends (up to +30min) so a slow
-      deep-reasoning reply is not cut off. The full response is ALWAYS printed to
-      stdout (never hidden behind --out); --out only saves an extra copy to disk.
-      Partial responses are also printed to stdout rather than discarded.
-  gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
+      deep-reasoning reply is not cut off. If --out is omitted, the bridge creates
+      one automatically; stdout should carry RESULT_FILE, not the full Pro response.
+      Use --print-full only for debugging.
+  gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
       Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and
       wait for the SAME reply instead of re-dispatching the prompt. ask is
       refused while an unfinished task (generating/timed-out, within 2h) is on
       record, to prevent re-dispatching the same prompt into a new conversation
       (death-loop). Pass --force to ask to discard the unfinished task. Use
-      continue (not ask) when a prior gpt-pro dispatch timed out. The full
-      response is ALWAYS printed to stdout (same gpt-pro exception as ask).
+      continue (not ask) when a prior gpt-pro dispatch timed out. If --out is
+      omitted, the bridge creates one automatically so stdout stays compact.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -135,7 +147,7 @@ those are dispatched.
 ## Evidence Gate (enforced by the Stop hook)
 
 Your final completion summary MUST include one or more "Plugin evidence:" lines, each
-naming the dispatched capability (ask / parse / web / vision / generate-image / mcp-tool / agy / gpt-pro) and the
+naming the dispatched capability (auto / ask / parse / web / vision / generate-image / test / mcp-tool / exec / agy / gpt-pro) and the
 exact command, turn id, transcript, or artifact path. The Stop hook REFUSES completion
 when dispatched work has no Plugin evidence line — even if you report the work as done.
 Copy the evidence lines that codex_bridge.ts prints; do not invent them.
@@ -156,10 +168,14 @@ required, you MUST route it to execution without stopping to wait for the user. 
 blockers are yours to solve, not the user's.
 
 Hard routing order — take the FIRST that succeeds:
-1. \`codex_bridge.ts test --full-access\` — spawn an ephemeral full-access worker. This is the
-   DEFAULT channel for any trusted op. It bypasses the PreToolUse gate AND the worker sandbox;
-   it can git push, write the plugin cache, write .git, and run arbitrary shell. Use it.
-2. \`dangerouslyDisableSandbox: true\` on the Bash tool — only for ops the gate mis-classifies
+1. \`codex_bridge.ts exec --full-access -- <command...>\` — deterministic local command runner.
+   This is the DEFAULT channel for build/test/install/git/cache/release commands that need no
+   model reasoning. It bypasses the PreToolUse gate and the worker sandbox, uses no LLM tokens,
+   writes the full log to RESULT_FILE, and prints only SUMMARY + evidence.
+   For deploy/push/paid/external side effects, ask the user first and pass \`--external --approved\`.
+2. \`codex_bridge.ts test --full-access\` — use only when the command needs Codex to reason over
+   logs, repair code, or iteratively run tests. It spawns an ephemeral full-access worker.
+3. \`dangerouslyDisableSandbox: true\` on the Bash tool — only for ops the gate mis-classifies
    as write but are effectively read-only. NOTE: this does NOT override the Leader gate for
    git write ops (git push/commit/tag); the gate is an independent layer. Do not retry a
    blocked git write this way — go straight to channel 1.
@@ -174,10 +190,11 @@ genuine product/architecture direction choices (revert a patch? change architect
 quota on a test?). These are judgment calls, not execution blockers.
 
 Rationale: the leader gate and worker sandbox exist to stop uncontrolled writes, but they
-also block legitimate release/ops work. The \`test --full-access\` channel is the sanctioned
-escape hatch for trusted ops. Using it is correct, not a workaround. Stopping to wait for
-the user on execution details is a failure mode — it breaks flow and treats a solved
-technical problem as if it needed human input.
+also block legitimate release/ops work. The \`exec --full-access\` channel is the sanctioned
+fast path for deterministic trusted ops; \`test --full-access\` is the slower model-assisted
+fallback. Using them is correct, not a workaround. Stopping to wait for the user on execution
+details is a failure mode — it breaks flow and treats a solved technical problem as if it
+needed human input.
 
 ## gpt-pro Continuation Loop (MANDATORY)
 
@@ -207,8 +224,7 @@ Hard rule: every gpt-pro dispatch is a CONTINUATION LOOP, not a single call. You
      --out file (incremental flush may have written it) and report partial + the conversation URL
      so the user can resume manually
 
-You MUST pass \`--out <file>\` on EVERY dispatch (ask and continue) — this is how output survives
-process kills and how you receive the RESULT_FILE pointer. NEVER dispatch gpt-pro without --out.
+Prefer passing \`--out <file>\` on EVERY gpt-pro dispatch (ask and continue) so the artifact path is predictable. If omitted, codex_bridge.ts creates an output file automatically; never use \`--print-full\` during normal leader operation.
 
 You MUST NOT stop the loop and ask the user "should I continue?" — that defeats the entire point.
 The only user-visible message during the loop is a brief status note when transitioning ask→continue
@@ -231,11 +247,12 @@ bridge primitive — never hand an in-flight dispatch to a later turn.
 ## Capability Routing
 
 ZCode routes each task to the right isolated worker and never does the work:
-substantive implementation -> codex (ask / ask-file); source code understanding
+substantive implementation -> codex auto (preferred) or ask / ask-file for bounded sub-packets; source code understanding
 (reading/explaining a code file) -> codex (parse); web research -> codex (web);
 visual understanding of an image -> codex (vision); image generation -> codex
-(generate-image); long-context / multimodal / live-web research -> agy; hardest
-code review / deep research on the strongest Pro model -> gpt-pro.
+(generate-image); deterministic build/test/install/git/cache/deploy commands -> exec (no LLM tokens);
+model-assisted full-access test/repair loops -> test --full-access; long-context / multimodal /
+live-web research -> agy; hardest code review / deep research on the strongest Pro model -> gpt-pro.
 
 ### Model tier routing (0.5.0)
 ZCode picks the right model per dispatch instead of one-model-fits-all:
@@ -277,23 +294,14 @@ the resident worker.
 ### Output Discipline (HARD — protect leader context)
 
 Worker stdout is the ONLY thing that flows back to ZCode. Keep it tiny. Rules:
-1. Default: any dispatch whose raw output may exceed ~200 words MUST write the
-   full output to a file (--out / ask-file / a temp path) and print ONLY the
-   path plus a <=200-word conclusion to stdout.
-2. ZCode's dispatch prompt MUST instruct the worker of this: 'Write detailed
-   output to <file>; print only the path and a <=200-word summary to stdout.'
+1. Default: every substantive dispatch writes the full output to a file (--out / ask-file / auto artifact / a temp path) and prints ONLY RESULT_FILE + a <=120-word SUMMARY + Plugin evidence to stdout.
+2. Prefer \`auto --request-file\` for implementation tasks so ZCode receives one compact structured result instead of many worker transcripts.
 3. Never dump raw command help, full DOM/state snapshots, full file contents,
-   or full LLM responses to stdout — those go to a file. ZCode reads the file
-   only if it needs the detail.
+   full diffs/logs, or full LLM responses to stdout — those go to artifact files.
+   ZCode reads the file only if it needs the detail for verification.
 4. ZCode treats worker stdout as advisory summary; the on-disk artifact is the
    source of truth for verification.
-5. EXCEPTION — gpt-pro: the Pro model's full response is ALWAYS printed to
-   stdout by the bridge (it is the primary output channel, not a file). Do NOT
-   pass --out expecting stdout to collapse to a path — the bridge ignores that
-   assumption and emits the full text regardless. If you need a disk copy, pass
-   --out; stdout still carries the full text. This exception exists because
-   gpt-pro is a synchronous browser-bridge dispatch whose result must reach the
-   leader directly within the same turn.
+5. Do NOT use --print-full during normal leader operation. It exists only for manual debugging.
 
 ### Synchronous Lightweight Wait (recap)
 

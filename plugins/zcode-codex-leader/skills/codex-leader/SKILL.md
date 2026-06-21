@@ -32,7 +32,8 @@ node --experimental-strip-types "${PLUGIN_ROOT}/scripts/codex_bridge.ts" <comman
 
 | Command | Use for | Example |
 |---------|---------|---------|
-| `ask <prompt>` | Code generation / parsing / Q&A | `codex_bridge.ts ask "write a merge sort in Python"` |
+| `auto --request-file <file>` | Preferred low-main-token implementation/test/review path | `codex_bridge.ts auto --request-file /tmp/request.md` |
+| `ask <prompt>` | Bounded code generation / parsing / Q&A | `codex_bridge.ts ask "write a merge sort in Python"` |
 | `ask <prompt> --image <path>` | Code grounded in an image | `codex_bridge.ts ask "what's wrong?" --image ./screenshot.png` |
 | `ask <prompt> --output-schema schema.json` | Structured/parseable output | constrain the worker to a JSON Schema |
 | `ask <prompt> --tier strong` | Force a model tier | `codex_bridge.ts ask "review this patch" --tier strong` |
@@ -40,10 +41,12 @@ node --experimental-strip-types "${PLUGIN_ROOT}/scripts/codex_bridge.ts" <comman
 | `web <query> [--depth 1-5]` | Web research (replaces WebSearch/WebFetch) | `codex_bridge.ts web "rust async patterns 2026"` |
 | `vision <image-path> <question>` | Describe/understand a local image | `codex_bridge.ts vision ./diagram.png "explain this architecture"` |
 | `generate-image <prompt> [--out <path>]` | Generate an image | `codex_bridge.ts generate-image "pixel-art mushroom"` |
-| `test <prompt> [-- <cmd>] [--browser]` | Run tests in an isolated sandboxed worker | `codex_bridge.ts test "run pytest" -- pytest -x` |
+| `test <prompt> [-- <cmd>] [--browser]` | Model-assisted sandboxed test/repair loop | `codex_bridge.ts test "run pytest" -- pytest -x` |
+| `exec -- <cmd>` | Deterministic local build/test/install/git/cache/deploy command, no LLM tokens | `codex_bridge.ts exec --timeout 600 -- npm test` |
+| `exec --external --approved -- <cmd>` | User-approved external side effect such as deploy/push | `codex_bridge.ts exec --external --approved -- git push` |
 | `mcp-tool <server> <tool> [--args <json>]` | Direct MCP tool call | `codex_bridge.ts mcp-tool filesystem read_file --args '{"path":"x"}'` |
 
-Each command prints the worker's result, then a trailing `Plugin evidence:` line.
+Substantive commands are compact by default: stdout prints `RESULT_FILE:<path>`, a <=120-word `SUMMARY:`, then a trailing `Plugin evidence:` line. Full worker output lives in the result file. Do not use `--print-full` during normal leader operation.
 
 ## Model tier routing (pick the right model per dispatch)
 
@@ -64,11 +67,12 @@ Rule of thumb: if the dispatch is "find/read/summarize" use fast; if it's "write
 
 ## How to run a task (the dispatch loop)
 
-1. **Decompose** the request into bounded packets. For each: objective, allowed paths, do/do-not, dependencies, expected evidence, stop condition.
-2. **Dispatch** each packet via `codex_bridge.ts`. Run independent packets in parallel; dependent ones in order.
-3. **Ingest & judge** each result: *accept* (verified), *reject* (reason), or *mark stale*. Record a one-line judgment.
-4. **Verify** the final state yourself with read-only checks (read the produced files, run tests if applicable).
-5. **Report** with a `Plugin evidence:` line per dispatched capability — copy the lines the bridge printed.
+1. For normal implementation, write the user request to a temporary request file and dispatch **one** `codex_bridge.ts auto --request-file <file>` call first. This minimizes ZCode main-token usage.
+2. Use lower-level `ask`/`parse`/`web`/`test` packets only when you need explicit routing or a rejected `auto` result needs repair.
+3. Use `exec` for deterministic local commands (build/test/install/git/cache). It uses no LLM tokens and bypasses the worker sandbox. Ask the user first for deploy/push/paid/external side effects, then pass `--external --approved`.
+4. **Ingest & judge** the compact result: *accept* (verified), *reject* (reason), or *mark stale*. Read the `RESULT_FILE` only if the summary is insufficient for verification.
+5. **Verify** the final state yourself with read-only checks (read the produced files, run tests if applicable).
+6. **Report** with a `Plugin evidence:` line per dispatched capability — copy the lines the bridge printed.
 
 ## Evidence gate (enforced)
 
