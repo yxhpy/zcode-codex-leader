@@ -16,6 +16,16 @@ function codexBinary(): string {
   return "codex";
 }
 
+// Kill an entire worker process group. codex spawns a dual-process worker
+// (node launcher pid A + codex binary pid B); killing only A leaks B because B
+// gets reparented to init and keeps serving WebSocket. spawn(detached:true) makes
+// the child a process-group leader (pgid == pid), so -pid kills the whole group.
+// Tolerate single-pid fallback for old sessions spawned before detached:true.
+function killProcessGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
+  try { process.kill(-pid, signal); } catch {}
+  try { process.kill(pid, signal); } catch {}
+}
+
 export function pluginDataDir(): string {
   const dir = process.env.PLUGIN_DATA || path.join(os.homedir(), ".codex/zcode-codex-leader-data");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -184,8 +194,12 @@ async function spawnWorker(imageGeneration: boolean, persist: boolean): Promise<
   if (persist) child.unref();
 
   const wsUrl = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timed out waiting for worker to print ws URL")), 8000);
     let acc = "";
+    const tail = () => acc.slice(-2000);
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      reject(new Error(`timed out waiting for worker to print ws URL (stderr tail):\n${tail()}`));
+    }, 8000);
     child.stderr?.on("data", (d: Buffer) => {
       acc += d.toString();
       const m = acc.match(/ws:\/\/127\.0\.0\.1:\d+/);
@@ -196,7 +210,7 @@ async function spawnWorker(imageGeneration: boolean, persist: boolean): Promise<
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`worker exited before binding (code=${code})`));
+      reject(new Error(`worker exited before binding (code=${code}, stderr tail):\n${tail()}`));
     });
   });
 
@@ -217,7 +231,7 @@ async function startWorker(): Promise<SessionState> {
   try {
     return await ensureResidentThread(state, process.cwd());
   } catch (e) {
-    try { child.kill("SIGTERM"); } catch {}
+    try { killProcessGroup(child.pid!); } catch {}
     unlinkSession();
     residentChild = undefined;
     throw e;
@@ -530,7 +544,12 @@ async function runTurnOnState(
   try {
     await initializeClient(client);
 
-    const useResidentThread = !!state.threadId && !process.env.FORCE_EPHEMERAL_THREAD;
+    // Default to ephemeral threads. Codex app-server has a bug where a resident
+    // thread accepts the first turn/start but hangs on the second (process alive,
+    // healthz up, but turn/start never returns). codex_bridge dispatches are
+    // stateless, so reusing a thread buys nothing and triggers the hang. Set
+    // FORCE_RESIDENT_THREAD=1 to opt back in once codex fixes the bug.
+    const useResidentThread = !!state.threadId && process.env.FORCE_RESIDENT_THREAD === "1";
     const threadId = useResidentThread ? state.threadId! : await startThread(client, cwd, true);
     const ephemeralThread = !useResidentThread;
 
@@ -538,12 +557,20 @@ async function runTurnOnState(
     const imageGeneration: Array<{ status: string; result: string; savedPath?: string }> = [];
     const rawItems: any[] = [];
     let done = false;
-    let lastActivityAt = Date.now();
     let lastToolCompletionAt = 0;
+    let workerDied = false;
+    let lastNotificationAt = Date.now();
+
+    // Detect mid-turn worker death via the WebSocket itself. The old
+    // isWorkerAlive() check reads a module-level residentChild that is undefined
+    // across codex_bridge CLI invocations, so it never fired. The WS close/error
+    // events fire regardless of which process spawned the worker.
+    client.ws.addEventListener("close", () => { workerDied = true; });
+    client.ws.addEventListener("error", () => { workerDied = true; });
 
     client.onNotification((m) => {
       const now = Date.now();
-      lastActivityAt = now;
+      lastNotificationAt = now;
 
       if (m.method === "item/completed") {
         const item = m.params?.item || {};
@@ -574,21 +601,36 @@ async function runTurnOnState(
     const turnId = turnResp.result?.turn?.id || turnResp.result?.turnId || "unknown";
     const startedAt = Date.now();
 
+    let breakReason: string | null = null;
     while (!done && Date.now() - startedAt < turnCeiling) {
-      const now = Date.now();
-      void lastActivityAt;
-
-      if (!isWorkerAlive()) {
-        break;
+      if (workerDied) { breakReason = "workerDied"; break; }
+      // Dual-process guard: codex runs as node-launcher (pid A, recorded in
+      // session) + codex-binary (pid B, the WS server). Killing A alone does not
+      // close the WS (B keeps serving), so workerDied never fires. Polling pid A
+      // liveness catches the half-death where A is gone but the WS still looks
+      // open — a stale worker that will hang the next turn/start.
+      if (state.pid) {
+        try { process.kill(state.pid, 0); } catch { breakReason = "parentPidGone"; break; }
       }
+      if (!isWorkerAlive()) { breakReason = "isWorkerAlive=false"; break; }
 
+      const now = Date.now();
       if (lastToolCompletionAt && now - lastToolCompletionAt > postToolQuietMs) {
         sendTurnInterrupt(client, turnId);
         residentThreadStale = true;
+        breakReason = "postToolQuiet";
         break;
       }
 
       await sleep(notificationPollMs);
+    }
+
+    if (breakReason && !done) {
+      const elapsedMs = Date.now() - startedAt;
+      const quietMs = Date.now() - lastNotificationAt;
+      process.stderr.write(
+        `[worker-hang] reason=${breakReason} elapsed=${Math.round(elapsedMs / 1000)}s lastNotification=${Math.round(quietMs / 1000)}s ago done=${done} turnId=${turnId}\n`,
+      );
     }
 
     return {
@@ -617,8 +659,8 @@ export async function runImageTurn(
   try {
     return await runTurnOnState(state, input, opts, opts.timeoutMs || 900000);
   } finally {
-    try { child.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
+    try { killProcessGroup(child.pid!); } catch {}
+    setTimeout(() => { try { killProcessGroup(child.pid!, "SIGKILL"); } catch {} }, 2000).unref?.();
   }
 }
 
@@ -653,13 +695,17 @@ export async function runTestTurn(
 
   const child: ChildProcess = spawn(codexBinary(), testWorkerArgs(!!opts.browser, !!opts.fullAccess), {
     stdio: ["pipe", "pipe", "pipe"],
-    detached: false,
+    detached: true,
     env: { ...process.env },
   });
 
   const wsUrl = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timed out waiting for worker to print ws URL")), 8000);
     let acc = "";
+    const tail = () => acc.slice(-2000);
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      reject(new Error(`timed out waiting for worker to print ws URL (stderr tail):\n${tail()}`));
+    }, 8000);
     child.stderr?.on("data", (d: Buffer) => {
       acc += d.toString();
       const m = acc.match(/ws:\/\/127\.0\.0\.1:\d+/);
@@ -670,7 +716,7 @@ export async function runTestTurn(
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`worker exited before binding (code=${code})`));
+      reject(new Error(`worker exited before binding (code=${code}, stderr tail):\n${tail()}`));
     });
   });
 
@@ -685,8 +731,8 @@ export async function runTestTurn(
   try {
     return await runTurnOnState(state, input, opts, opts.timeoutMs || 600000);
   } finally {
-    try { child.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
+    try { killProcessGroup(child.pid!); } catch {}
+    setTimeout(() => { try { killProcessGroup(child.pid!, "SIGKILL"); } catch {} }, 2000).unref?.();
   }
 }
 
@@ -721,7 +767,10 @@ export async function callMcpTool(
 export async function stopServer(): Promise<void> {
   const s = readSession();
   if (!s) return;
-  try { process.kill(s.pid, "SIGTERM"); } catch {}
+  killProcessGroup(s.pid);
+  // Escalate to SIGKILL after a grace period. A worker that ignores SIGTERM
+  // would otherwise be leaked (the old code only sent SIGTERM once).
+  setTimeout(() => { try { killProcessGroup(s.pid, "SIGKILL"); } catch {} }, 2000).unref?.();
   unlinkSession();
   residentChild = undefined;
   residentThreadStale = false;
