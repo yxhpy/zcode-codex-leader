@@ -31,10 +31,10 @@ Make ZCode/Codex a pure **leader/owner** that never does substantive implementat
    │ watchdog:           │                          │ generate-image        │
    │  keep worker alive  │                          │ test / exec / mcp-tool│
    │ pre-tool-use:       │                          │ agy / gpt-pro         │
-   │  block writes,      │                          │ (each bumps           │
-   │  allow reads+bridge │                          │  dispatchCount,       │
-   │ user-prompt-submit: │                          │  prints RESULT_FILE + │
-   │  append reminder    │                          │  SUMMARY + evidence) │
+   │  block writes,      │                          │ (gpt-pro supports     │
+   │  allow reads+bridge │                          │  start/poll/collect/  │
+   │ user-prompt-submit: │                          │  cancel; compact      │
+   │  append reminder    │                          │  output + evidence)  │
    │ stop:               │                          └───────────────────────┘
    │  evidence gate      │
    └─────────────────────┘
@@ -78,6 +78,12 @@ Environment: `${PLUGIN_ROOT}` (and `${CLAUDE_PLUGIN_ROOT}` alias) is the install
 ## Session state
 
 `session.json` (in `PLUGIN_DATA`) holds: `pid`, `wsUrl`, `healthUrl`, `startedAt`, `dispatchCount`. Threads are **per-dispatch ephemeral** (not reused across calls) — reusing a long-lived thread was observed to leave turns without a `turn/completed` notification. ZCode (the leader) holds cross-packet context itself, so per-dispatch threads match the bounded-packet model.
+
+## GPT-Pro background tasks (0.8.7+)
+
+`gpt-pro start ask/continue` creates a detached worker process with its own task file under `PLUGIN_DATA/gpt-pro/tasks/<task-id>.json`, result artifact under `PLUGIN_DATA/gpt-pro/results/<task-id>.txt`, and log under `PLUGIN_DATA/gpt-pro/logs/<task-id>.log`. The start call returns immediately with `TASK_ID`, `TASK_FILE`, `RESULT_FILE`, `POLL_CMD`, `COLLECT_CMD`, and `CANCEL_CMD`; later foreground `poll`/`collect`/`cancel` calls read or update the durable task file. This is the explicit exception to same-turn synchronous waiting, added because ChatGPT Pro generations can exceed the ZCode Bash 600s ceiling.
+
+Legacy foreground `gpt-pro ask/continue` still exists for short/manual use, but long Pro work should use start/poll/collect.
 
 ## Model tier routing (0.5.0)
 

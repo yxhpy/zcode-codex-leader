@@ -103,22 +103,24 @@ Commands:
       ask the user first, then pass --external --approved.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch to local Antigravity CLI (agy) for long-context / multimodal / live-web work.
+  gpt-pro start ask <prompt> [--out <file>] [--timeout <sec>]
+      Start a detached ChatGPT Pro background task. Returns TASK_ID, TASK_FILE,
+      RESULT_FILE, POLL_CMD, COLLECT_CMD immediately; the worker continues after
+      the Bash tool returns, so long Pro generations do not hit the 600s ceiling.
+  gpt-pro poll [--task-id <id>]
+      Read task-file status only; never drives the browser and never prints the
+      full Pro answer. Use for progress / stale detection.
+  gpt-pro collect [--task-id <id>] [--partial]
+      Collect a completed background task. Prints RESULT_FILE + compact SUMMARY.
+      With --partial, a timed-out/stale/cancelled task may expose PARTIAL_FILE.
+  gpt-pro cancel [--task-id <id>]
+      Mark a background task cancelled and SIGTERM its detached worker process group.
   gpt-pro ask <prompt> [--out <file>] [--timeout <sec>] [--print-full]
-      Dispatch a hard code review or deep question to ChatGPT web (Pro model) via
-      the opencli Browser Bridge. gpt-pro status checks Bridge / login / Pro tier.
-      Default --timeout is 900s; if the Pro model is still actively generating
-      when the timeout hits, the deadline auto-extends (up to +30min) so a slow
-      deep-reasoning reply is not cut off. If --out is omitted, the bridge creates
-      one automatically; stdout should carry RESULT_FILE, not the full Pro response.
-      Use --print-full only for debugging.
+      Foreground compatibility mode for short/manual Pro calls only. Avoid it for
+      deep tasks likely to exceed the Bash tool's 600s ceiling; use start/poll/collect.
   gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
-      Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and
-      wait for the SAME reply instead of re-dispatching the prompt. ask is
-      refused while an unfinished task (generating/timed-out, within 2h) is on
-      record, to prevent re-dispatching the same prompt into a new conversation
-      (death-loop). Pass --force to ask to discard the unfinished task. Use
-      continue (not ask) when a prior gpt-pro dispatch timed out. If --out is
-      omitted, the bridge creates one automatically so stdout stays compact.
+      Foreground compatibility resume mode. Prefer `gpt-pro start continue --task-id <id>`
+      for long recoveries so the resumed worker is detached.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -196,53 +198,40 @@ fallback. Using them is correct, not a workaround. Stopping to wait for the user
 details is a failure mode — it breaks flow and treats a solved technical problem as if it
 needed human input.
 
-## gpt-pro Continuation Loop (MANDATORY)
+## gpt-pro Background Task Loop (MANDATORY)
 
-gpt-pro tasks run on ChatGPT Pro and routinely exceed the Bash tool's 600s ceiling. A single
-\`gpt-pro ask\` dispatch will be killed mid-generation. This is EXPECTED, not a failure. You MUST
-not treat a Bash-timeout on gpt-pro as task failure, and you MUST NOT report "timed out" to the
-user and stop. The plugin's job is to keep waiting until Pro actually returns.
+gpt-pro tasks run on ChatGPT Pro and routinely exceed the Bash tool's 600s ceiling. Long Pro work
+MUST use the detached background protocol, not a blocking foreground ask.
 
-Hard rule: every gpt-pro dispatch is a CONTINUATION LOOP, not a single call. You MUST loop:
+Hard rule for any hard code review / deep research likely to exceed a few minutes:
 
-1. dispatch \`gpt-pro ask "<prompt>" --out <file> --timeout <sec>\`
-2. if it returns \`RESULT_FILE:<path>\` — DONE, read the file, continue with the result
-3. if the Bash call is killed (600s ceiling) or the process exits without RESULT_FILE:
-   a. read the task file (\`~/.codex/zcode-codex-leader-data/gpt-pro-task.json\`)
-   b. if it has \`conversationUrl\` and \`status: "generating"\` — the task is still alive on
-      ChatGPT's server. dispatch \`gpt-pro continue --url <task.conversationUrl> --out <file>
-      --timeout <sec>\` and go to step 2
-   c. if the task file is missing or shows a terminal state with no recoverable url — FAIL,
-      report to the user
-4. repeat step 3 until ONE of these终止 conditions:
-   - SUCCESS: a dispatch returns \`RESULT_FILE:<path>\`
-   - FAILURE: conversationUrl is invalid/expired, OR ChatGPT returns an explicit error
-     ("Something went wrong"), OR three consecutive continues return identical empty/short output
-     (Pro stuck)
-   - BUDGET: cumulative wall-clock across all dispatches exceeds 60 minutes (configurable per-task
-     via a note in the prompt). At budget exhaustion, read whatever partial output is in the
-     --out file (incremental flush may have written it) and report partial + the conversation URL
-     so the user can resume manually
+1. dispatch \`gpt-pro start ask "<prompt>" --out <file> --timeout <sec>\`
+2. record \`TASK_ID\`, \`TASK_FILE\`, and \`RESULT_FILE\` from stdout
+3. use \`gpt-pro poll --task-id <TASK_ID>\` for progress; this reads only the task file and returns quickly
+4. if the user cancels or the task is no longer wanted, run \`gpt-pro cancel --task-id <TASK_ID>\`
+5. use \`gpt-pro collect --task-id <TASK_ID>\` until ONE terminal condition:
+   - SUCCESS: \`STATUS:completed\` and \`RESULT_FILE:<path>\` exists — read the artifact and continue
+   - RECOVERABLE: \`STATUS:timed-out\` or \`STATUS:stale\` with \`CONVERSATION_URL\` — run
+     \`gpt-pro start continue --task-id <TASK_ID> --out <file>\`, then resume polling
+   - PARTIAL: terminal non-success with \`--partial\` exposing \`PARTIAL_FILE\` — use/report partial output
+   - FAILURE: explicit ChatGPT/browser error with no recoverable URL or partial artifact
 
-Prefer passing \`--out <file>\` on EVERY gpt-pro dispatch (ask and continue) so the artifact path is predictable. If omitted, codex_bridge.ts creates an output file automatically; never use \`--print-full\` during normal leader operation.
+Do NOT re-run \`gpt-pro ask\` for the same prompt while a task is active; that opens a new Pro
+conversation and wastes quota. Use poll/collect/continue on the same TASK_ID. Never use
+\`--print-full\` during normal leader operation; stdout must stay compact.
 
-You MUST NOT stop the loop and ask the user "should I continue?" — that defeats the entire point.
-The only user-visible message during the loop is a brief status note when transitioning ask→continue
-(e.g. "gpt-pro still generating on ChatGPT, continuing to wait (turn 2)..."). Keep going.
-
-This rule overrides any instinct to treat a single Bash timeout as failure. Pro tasks are long;
-the plugin waits.
+Foreground \`gpt-pro ask\` / \`gpt-pro continue\` remain only for short/manual compatibility.
+If a foreground Pro call is killed by the Bash ceiling, treat it as a legacy recoverable event:
+read the saved task metadata and continue via the background protocol when possible.
 
 ## Synchronous Lightweight Wait (SLW)
 
-Every dispatch MUST be dispatched and recovered within the SAME ZCode turn; a
-dispatch still in-flight when a turn ends is a violation. The bridge call runs
-foreground — the Bash call blocks until codex_bridge.ts exits and returns its
-stdout, which IS the synchronous wait. Rules: NEVER pass run_in_background to a
-codex_bridge.ts dispatch (always foreground); for long tasks the bridge
-subcommand blocks internally and returns when done, so do not yield the turn
-mid-dispatch; if a dispatch would exceed the Bash ceiling, poll in-turn via a
-bridge primitive — never hand an in-flight dispatch to a later turn.
+Default dispatches MUST be dispatched and recovered within the SAME ZCode turn; the
+bridge call runs foreground and returns compact stdout. Exception: \`gpt-pro start\`
+creates a durable detached task by design, because Pro generations can exceed the Bash
+600s ceiling. For that exception, the foreground bridge call is only the START/POLL/COLLECT/CANCEL
+primitive; the durable task file is the synchronization boundary. NEVER use the Bash tool's
+run_in_background for codex_bridge.ts itself.
 
 ## Capability Routing
 
@@ -305,11 +294,12 @@ Worker stdout is the ONLY thing that flows back to ZCode. Keep it tiny. Rules:
 
 ### Synchronous Lightweight Wait (recap)
 
-Foreground dispatch only; NEVER run_in_background on a codex_bridge.ts call. The
-Bash call blocks until the bridge exits — that blocking IS the wait. Long tasks
-(agy, gpt-pro) block inside the bridge subcommand; do not yield the turn
-mid-dispatch. If a dispatch would exceed the Bash ceiling, poll in-turn via a
-read on the result file — never hand an in-flight dispatch to a later turn.
+Foreground bridge invocation only; NEVER run_in_background on a codex_bridge.ts call. The
+Bash call blocks until the bridge exits — that blocking IS the wait. Long deterministic
+or Codex-worker tasks should still complete inside the bridge call. GPT-Pro is the explicit
+exception: use \`gpt-pro start\` to create a detached durable task, then later foreground
+\`gpt-pro poll\` / \`gpt-pro collect\` / \`gpt-pro cancel\` bridge calls to synchronize. Do not hand off any other
+in-flight dispatch to a later turn.
 
 ## Hard Stop
 

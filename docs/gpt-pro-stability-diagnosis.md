@@ -3,6 +3,7 @@
 **日期**: 2026-06-21
 **触发**: 用户报告「gpt-pro 长任务依然不稳定」
 **结论**: 根因不是单点 bug，而是 **dispatch 超时栈的层数与最外层 Bash 工具 600s ceiling 不匹配**。已应用的两个补丁是必要但不充分的修复。
+**更新**: 已实现第一阶段后台任务协议：`gpt-pro start ask/continue`、`gpt-pro poll`、`gpt-pro collect`、`gpt-pro cancel`。长任务可 detached 运行并通过 `gpt-pro/tasks/<task-id>.json` + `gpt-pro/results/<task-id>.txt` 同步，避免 ZCode Bash 600s ceiling 杀死 Pro worker。旧 `gpt-pro ask/continue` 仍保留为前台兼容模式。
 
 ---
 
@@ -43,11 +44,12 @@ ZCode Bash 工具                          ceiling: 600s (10min)  ← 最短板
           └─ opencli Browser Bridge       驱动 ChatGPT 网页，长任务可达数十分钟
 ```
 
-**Bash 600s ceiling 是整个栈最外面的、最短的墙**。无论内层怎么调，任务实际运行 >10min 就会被 Bash 工具 abort。
+**Bash 600s ceiling 是 blocking foreground 栈最外面的、最短的墙**。无论内层怎么调，前台任务实际运行 >10min 就会被 Bash 工具 abort。新 `start/poll/collect` background path 通过 detached worker 绕开此前台栈。
 
 关键证据（`codex_bridge.ts` parse）：
-- gpt-pro spawn **attached**，无 `detached:true`（`codex_bridge.ts:447-451`）——父进程死，子进程连带死
-- gpt-pro dispatch **纯阻塞等待** child close（`codex_bridge.ts:464-476`），**无 polling、无 result-file 轮询机制**
+- 旧 gpt-pro foreground spawn **attached**，无 `detached:true`（`codex_bridge.ts:447-451`）——父进程死，子进程连带死
+- 旧 gpt-pro foreground dispatch **纯阻塞等待** child close（`codex_bridge.ts:464-476`）
+- 新 gpt-pro background dispatch 使用 detached worker + task/result/log artifact + poll/collect/cancel
 - agy 同样 attached、纯阻塞（`codex_bridge.ts:373-377, 386-398`），default print-timeout 20min——**同样会被 Bash 600s 杀**
 - codex_bridge.ts 对外层 Bash ceiling **零感知**（无 600000 常量）
 
@@ -77,40 +79,39 @@ const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLim
 
 ---
 
-## 未解的真根因：Bash 600s ceiling vs SLW
+## 已缓解的真根因：Bash 600s ceiling vs SLW
 
 ### 冲突点
 
-Constitution 的 SLW（同步轻量等待）规则要求：
+Constitution 旧 SLW（同步轻量等待）规则要求：
 > 每个 dispatch 必须在同一个 ZCode turn 内 dispatch 并回收；禁止 `run_in_background`。Bash call 阻塞直到 codex_bridge.ts 退出。
 
-但 Bash 工具自身有 600s（10min）硬 ceiling。任何实际运行 >10min 的 gpt-pro/agy 任务：
-- 按 SLW 必须 foreground → 被 600s ceiling 杀
-- 要避开 600s 必须 background → 违反 SLW
+但 Bash 工具自身有 600s（10min）硬 ceiling。任何实际运行 >10min 的 blocking foreground gpt-pro/agy 任务：
+- 按旧 SLW 必须 foreground → 被 600s ceiling 杀
+- 要避开 600s 必须 background → 旧 SLW 不允许
 
-**这是架构层面的死结**，不是补丁能解的。
+### 当前解法（gpt-pro 第一阶段已实现）
 
-### 影响范围
+`gpt-pro start ask/continue` 是 SLW 的显式例外：bridge 前台调用只负责创建 detached durable task 并立即返回；后续 `poll/collect/cancel` 前台调用读取或更新 task/result artifact。禁止的是 ZCode Bash tool 自己的 `run_in_background`，不是 plugin 内部受控 detached worker。
 
-- **gpt-pro 长任务**（深度推理 >10min）：必死
-- **agy 长任务**（长上下文研究，default 20min）：必死
-- **gpt-pro continue**（续接超时对话）：同样必死，因为也是阻塞 spawn
-
-### 短期 workaround（不改架构）
-
-**用户在终端直接跑 gpt-pro，不经过 ZCode**：
 ```bash
-node --experimental-strip-types \
-  ~/.zcode/cli/plugins/cache/zcode-plugins-official/zcode-codex-leader/0.8.0/scripts/codex_bridge.ts \
-  gpt-pro ask "<prompt>" --out <file> --timeout 2400
+codex_bridge.ts gpt-pro start ask "<prompt>" --out <file> --timeout 2400
+codex_bridge.ts gpt-pro poll --task-id <id>
+codex_bridge.ts gpt-pro collect --task-id <id>
+# optional: codex_bridge.ts gpt-pro cancel --task-id <id>
 ```
-这样没有 Bash 600s ceiling，补丁 #1 的 46min 预算真正生效，内部续命能跑完。
 
-### 根治方向（需架构改动，本报告不实施）
+### 剩余影响范围
 
-1. **gpt-pro/agy spawn 改 `detached:true` + 结果文件轮询**：ZCode turn 内只发起任务（秒级返回），后续 turn 轮询结果文件。但这违反 SLW，需同时改 constitution。
-2. **codex_bridge.ts 识别 Bash ceiling**：检测到 dispatch 预算 >600s 时，主动告诉 leader「这个任务必须后台跑，请轮询」，而不是阻塞等死。
-3. **ZCode harness 抬高 Bash ceiling**：最简单但最不现实，600s 是为了防 runaway。
+- **gpt-pro foreground 长任务**（深度推理 >10min）：仍会被 Bash ceiling 杀；改用 `gpt-pro start ask`。
+- **agy 长任务**（长上下文研究，default 20min）：仍是 blocking spawn，仍会被 Bash ceiling 杀。
+- **gpt-pro foreground continue**：仍会被 Bash ceiling 杀；改用 `gpt-pro start continue --task-id <id>`。
+
+### 后续方向
+
+1. 将 gpt-pro 默认 `ask/continue` 路由到 background（目前保留前台兼容）。
+2. 对 agy 做同类 detached job 协议。
+3. `codex_bridge.ts` 对 foreground 长预算给出显式警告或拒绝。
 
 ---
 
@@ -126,10 +127,10 @@ node --experimental-strip-types \
 
 ## 给用户的实操建议
 
-1. **短任务（<10min）**：照常用 `gpt-pro ask`，补丁让短任务更稳。
-2. **长任务（>10min）**：**在终端直接跑**，别经过 ZCode Bash 工具。补丁 #1 在这种场景才真正生效。
-3. **遇到卡死的 generating task**：不用 `--force`，直接再跑一次 `gpt-pro ask`，补丁 #2 会自动检测 pid 已死并清锁。旧的 `--force` 仍然可用。
-4. **额度不会因补丁少烧**：真正的死 task（pid 死了）才清；活着的 task 仍按 2h 死循环防护挡住，避免重复 dispatch 浪费。
+1. **短任务（<10min）**：可继续用 foreground `gpt-pro ask`，但 stdout 仍应走 `--out` artifact。
+2. **长任务（>10min）**：用 `gpt-pro start ask`，记录 `TASK_ID`，之后 `poll/collect`。不要再要求用户离开 ZCode 手动终端直跑。
+3. **续接/恢复**：如果 task 有 `CONVERSATION_URL` 且状态 `timed-out/stale`，用 `gpt-pro start continue --task-id <id>`，不要重新 `ask` 同一 prompt。
+4. **额度保护**：真正死掉的 worker 会被 `poll` 标成 `stale`；活着的 task 通过 pid/heartbeat 防重复 dispatch，避免浪费 Pro 额度。
 
 ---
 
@@ -141,10 +142,7 @@ node --experimental-strip-types \
 | Layer 1 | `isPidAlive` 5 单元用例 | ✅ 5/5 PASS |
 | Layer 2 | stale-lock 集成测试（真实 task 文件） | ✅ CLEAR_LOCK_AND_PROCEED |
 | Layer 2 | 外层超时预算公式 3 场景 | ✅ 3/3 PASS，续命永不被截断 |
-| Layer 3 | 真实 Pro 长任务端到端 | ⚠️ 补丁逻辑对，但被 Bash 600s ceiling 反杀 |
+| Layer 3 | foreground 真实 Pro 长任务端到端 | ⚠️ 补丁逻辑对，但被 Bash 600s ceiling 反杀 |
+| Layer 3 | background fake worker start/poll/collect | ✅ detached task/result/log artifact flow PASS |
 
-补丁文件 md5（worktree == cache）：
-- `codex_bridge.ts`: `5c854f27ae3209058543bec9b61741a7`
-- `gpt_pro.ts`: `25dfa3f7987fb6905a854184445021ca`
-
-原文件备份：`~/.zcode/cli/plugins/cache/.../scripts/*.bak-20260621-160104`
+注：md5/cache 版本应以当前 release/install 验证输出为准；本报告不再固定历史 cache md5。

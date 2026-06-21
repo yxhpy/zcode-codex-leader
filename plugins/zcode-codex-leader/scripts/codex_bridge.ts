@@ -29,6 +29,11 @@
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
 //       Dispatch a task to the local Antigravity CLI (agy) — long-context,
 //       multimodal, live web.
+//   gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+//   gpt-pro start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]
+//   gpt-pro poll [--task-id <id> | --task-file <file>]
+//   gpt-pro collect [--task-id <id> | --task-file <file>] [--partial]
+//   gpt-pro cancel [--task-id <id> | --task-file <file>]
 //   gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
 //   gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
 //   gpt-pro status
@@ -442,6 +447,8 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
   const args: string[] = [];
   if (command === "status") {
     args.push("status");
+  } else if (command === "start" || command === "poll" || command === "collect" || command === "cancel") {
+    args.push(...rawArgsAfterSubcommand("gpt-pro"));
   } else if (command === "help" || command === "--help" || command === "-h") {
     args.push("help");
   } else if (command === "continue") {
@@ -469,7 +476,7 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     if (flags.timeout) args.push("--timeout", flags.timeout);
     if (flags.force) args.push("--force");
   } else {
-    fail("gpt-pro requires status, ask, continue, or help");
+    fail("gpt-pro requires start, poll, collect, cancel, status, ask, continue, or help");
   }
 
   const scriptDir = path.dirname(new URL(import.meta.url).pathname);
@@ -519,6 +526,8 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
 
   if (timedOut) fail(`gpt-pro timed out after ${hardTimeoutMs}ms`);
   if (code !== 0) {
+    const childOutOnError = Buffer.concat(stdout).toString();
+    if (childOutOnError) process.stdout.write(childOutOnError);
     process.stderr.write(Buffer.concat(stderr).toString());
     fail(`gpt-pro exited with code ${code}`);
   }
@@ -1009,9 +1018,16 @@ Usage:
       Resume an interrupted run.
   codex_bridge resume --run <run_id>
       Alias for 'run --run'.
+  codex_bridge gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
+  codex_bridge gpt-pro start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]
+      Start a detached GPT-Pro background task; stdout returns TASK_ID/TASK_FILE/RESULT_FILE/POLL_CMD/COLLECT_CMD/CANCEL_CMD.
+  codex_bridge gpt-pro poll [--task-id <id> | --task-file <file>]
+  codex_bridge gpt-pro collect [--task-id <id> | --task-file <file>] [--partial]
+  codex_bridge gpt-pro cancel [--task-id <id> | --task-file <file>]
+      Poll/collect/cancel background GPT-Pro task files without driving the browser; stdout stays compact.
   codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>] [--print-full]
   codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
-      Resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL. If --out is omitted, bridge creates one so stdout stays small.
+      Foreground compatibility mode: resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL. If --out is omitted, bridge creates one so stdout stays small.
   codex_bridge gpt-pro status
   codex_bridge gpt-pro help
       Dispatch to ChatGPT web Pro via opencli Browser Bridge.

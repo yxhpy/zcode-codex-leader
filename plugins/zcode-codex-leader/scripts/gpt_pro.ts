@@ -1,7 +1,8 @@
 #!/usr/bin/env -S node --experimental-strip-types
 
 import { spawn } from "child_process";
-import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync, unlinkSync, mkdirSync, renameSync, readdirSync, openSync, closeSync } from "node:fs";
 import path, { basename, extname, isAbsolute, resolve } from "node:path";
 import { pluginDataDir } from "./app_server_pool.ts";
 
@@ -12,16 +13,38 @@ type RunResult = {
   error?: Error;
 };
 
+type GptProStatus = "starting" | "submitted" | "running" | "generating" | "timed-out" | "completed" | "failed" | "stale" | "cancelled";
+
 type GptProTask = {
-  conversationUrl: string;
-  conversationId: string;
-  prompt: string;
-  baselineCount: number;
-  sentAt: number;
+  schemaVersion?: 1 | 2;
+  taskId?: string;
+  command?: "ask" | "continue";
+  conversationUrl?: string;
+  conversationId?: string;
+  prompt?: string;
+  promptFile?: string;
+  files?: string[];
+  baselineCount?: number;
+  sentAt?: number;
+  createdAt?: number;
+  updatedAt?: number;
+  startedAt?: number;
+  submittedAt?: number;
+  finishedAt?: number;
+  timeoutSec?: number;
+  deadlineAt?: number;
+  absoluteCeilingAt?: number;
   pid?: number;
   heartbeatAt?: number;
-  status: "generating" | "timed-out" | "completed";
+  status: GptProStatus;
+  outPath?: string;
+  resultPath?: string;
+  partialPath?: string;
+  logPath?: string;
   partialText?: string;
+  summary?: string;
+  lastError?: string;
+  exitCode?: number | null;
 };
 
 type AskArgs = {
@@ -65,23 +88,77 @@ const PROMPT_SENT_JS =
 const CLEAR_COMPOSER_JS =
   "(()=>{const el=document.querySelector('#prompt-textarea');if(!el)return JSON.stringify({ok:false,error:'missing composer'});el.innerHTML='';el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));const textarea=document.querySelector('textarea[name=\"prompt-textarea\"]');if(textarea){textarea.value='';textarea.dispatchEvent(new Event('input',{bubbles:true}));}const input=document.querySelector('#upload-files');if(input){input.files=new DataTransfer().files;input.dispatchEvent(new Event('change',{bubbles:true}));}for(const b of [...document.querySelectorAll('[aria-label*=\"移除文件\"],[aria-label*=\"Remove file\"],[aria-label*=\"remove file\"]')]){b.click();}return JSON.stringify({ok:true});})()";
 
-function taskPath(): string {
+function legacyTaskPath(): string {
   return path.join(pluginDataDir(), "gpt-pro-task.json");
 }
 
-function readTask(): GptProTask | null {
+function taskDir(): string {
+  return path.join(pluginDataDir(), "gpt-pro", "tasks");
+}
+
+function latestTaskPointerPath(): string {
+  return path.join(pluginDataDir(), "gpt-pro", "latest-task.json");
+}
+
+function startLockPath(): string {
+  return path.join(pluginDataDir(), "gpt-pro", "start.lock");
+}
+
+function safeTaskId(id: string): string {
+  const cleaned = id.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 120);
+  if (!cleaned) throw new Error("invalid empty gpt-pro task id");
+  return cleaned;
+}
+
+function taskPathForId(taskId: string): string {
+  return path.join(taskDir(), `${safeTaskId(taskId)}.json`);
+}
+
+function taskPath(): string {
+  return process.env.GPT_PRO_TASK_FILE || legacyTaskPath();
+}
+
+function normalizeTask(raw: any): GptProTask | null {
+  if (!raw || typeof raw !== "object") return null;
+  if (!raw.status) raw.status = raw.conversationUrl ? "generating" : "starting";
+  if (!raw.schemaVersion) raw.schemaVersion = 1;
+  return raw as GptProTask;
+}
+
+function readTaskFile(filePath = taskPath()): GptProTask | null {
   try {
-    if (!existsSync(taskPath())) return null;
-    const t = JSON.parse(readFileSync(taskPath(), "utf8")) as GptProTask;
-    if (!t || !t.conversationUrl) return null;
-    return t;
+    if (!existsSync(filePath)) return null;
+    return normalizeTask(JSON.parse(readFileSync(filePath, "utf8")));
   } catch {
     return null;
   }
 }
 
+function readTask(): GptProTask | null {
+  return readTaskFile(taskPath());
+}
+
+function writeTaskFile(filePath: string, t: GptProTask): void {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const next: GptProTask = { ...t, updatedAt: Date.now() };
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(next, null, 2));
+  renameSync(tmp, filePath);
+}
+
 function writeTask(t: GptProTask): void {
-  writeFileSync(taskPath(), JSON.stringify(t, null, 2));
+  writeTaskFile(taskPath(), t);
+}
+
+function patchTaskFile(filePath: string, patch: Partial<GptProTask>): GptProTask {
+  const existing = readTaskFile(filePath) || { status: "starting" as GptProStatus };
+  const next = { ...existing, ...patch } as GptProTask;
+  writeTaskFile(filePath, next);
+  return next;
+}
+
+function patchTask(patch: Partial<GptProTask>): GptProTask {
+  return patchTaskFile(taskPath(), patch);
 }
 
 function isPidAlive(pid?: number): boolean {
@@ -89,8 +166,32 @@ function isPidAlive(pid?: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+const TERMINAL_TASK_STATUSES = new Set<GptProStatus>(["completed", "timed-out", "failed", "stale", "cancelled"]);
+
+function isTerminalTaskStatus(status?: string): boolean {
+  return TERMINAL_TASK_STATUSES.has(status as GptProStatus);
+}
+
+function touchTaskHeartbeat(status?: GptProStatus): void {
+  const task = readTask();
+  if (!task || isTerminalTaskStatus(task.status)) return;
+  task.heartbeatAt = Date.now();
+  task.pid = process.pid;
+  if (status) task.status = status;
+  writeTask(task);
+}
+
 function clearTask(): void {
   try { unlinkSync(taskPath()); } catch {}
+}
+
+function absolutePathMaybe(p?: string): string | undefined {
+  if (!p) return undefined;
+  return isAbsolute(p) ? p : resolve(process.cwd(), p);
+}
+
+function isBackgroundWorker(): boolean {
+  return process.env.GPT_PRO_BACKGROUND_WORKER === "1";
 }
 
 // ponytail: incremental-flush state for SIGTERM recovery. waitForAssistantReply updates this on every grow-flush so a SIGTERM handler can do one final save before exit.
@@ -100,9 +201,10 @@ let pendingPartial: { text: string; out?: string } | null = null;
 function flushPartial(text: string, out?: string): void {
   if (!text) return;
   pendingPartial = { text, out };
-  if (out) {
-    const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
+  const absoluteOut = absolutePathMaybe(out);
+  if (absoluteOut) {
     try {
+      mkdirSync(path.dirname(absoluteOut), { recursive: true });
       writeFileSync(absoluteOut, text, "utf8");
     } catch (e) {
       process.stderr.write(`gpt-pro: incremental flush to ${absoluteOut} failed: ${(e as Error).message}\n`);
@@ -111,6 +213,10 @@ function flushPartial(text: string, out?: string): void {
   const task = readTask();
   if (task && task.status !== "completed") {
     task.partialText = text;
+    task.partialPath = absoluteOut || task.partialPath;
+    task.outPath = absoluteOut || task.outPath;
+    task.heartbeatAt = Date.now();
+    if (task.status === "starting" || task.status === "submitted") task.status = "running";
     writeTask(task);
   }
 }
@@ -120,9 +226,16 @@ function usage(): string {
     "Usage:",
     "  gpt_pro.ts help",
     "  gpt_pro.ts status",
+    "  gpt_pro.ts start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
+    "  gpt_pro.ts start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]",
+    "  gpt_pro.ts poll [--task-id <id> | --task-file <file>]",
+    "  gpt_pro.ts collect [--task-id <id> | --task-file <file>] [--partial]",
+    "  gpt_pro.ts cancel [--task-id <id> | --task-file <file>]",
+    "      Background mode: start returns TASK_ID/TASK_FILE/RESULT_FILE immediately;",
+    "      poll/collect/cancel read or update task files and keep stdout compact.",
     "  gpt_pro.ts ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
     "  gpt_pro.ts continue [--url <url>] [--timeout <sec>] [--out <file>]",
-    "      Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and",
+    "      Foreground compatibility mode. Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and",
     "      wait for the SAME reply instead of re-dispatching the prompt. ask refuses",
     "      to re-dispatch while an unfinished task (generating/timed-out, within 2h)",
     "      is on record; pass --force to ask to discard it.",
@@ -134,6 +247,17 @@ function usage(): string {
 
 function log(message: string): void {
   process.stderr.write(`${message}\n`);
+}
+
+function summarizeTaskText(text: string, maxWords = 80): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "(no output)";
+  return normalized.split(" ").slice(0, maxWords).join(" ");
+}
+
+function printLine(key: string, value: unknown): void {
+  if (value === undefined || value === null || value === "") return;
+  process.stdout.write(`${key}:${String(value)}\n`);
 }
 
 function canExecute(file: string): boolean {
@@ -466,8 +590,19 @@ async function readAssistantSnapshot(deadline?: number): Promise<{ count: number
 function writeAssistantOutput(text: string, out?: string): void {
   if (out) {
     // ponytail: long-output stability — when --out is set, the full text lives in the file (durable, survives process kill). stdout emits ONLY a pointer so codex_bridge.ts never has to pipe megabytes of text through Bash's 600s ceiling. The leader reads the result from the file.
-    const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
+    const absoluteOut = absolutePathMaybe(out)!;
+    mkdirSync(path.dirname(absoluteOut), { recursive: true });
     writeFileSync(absoluteOut, text, "utf8");
+    const task = readTask();
+    if (task) {
+      task.outPath = absoluteOut;
+      task.resultPath = absoluteOut;
+      task.partialPath = absoluteOut;
+      task.partialText = text;
+      task.summary = summarizeTaskText(text);
+      task.heartbeatAt = Date.now();
+      writeTask(task);
+    }
     process.stdout.write(`RESULT_FILE:${absoluteOut}\n`);
     process.stderr.write(`gpt-pro: result saved to ${absoluteOut}\n`);
   } else {
@@ -515,6 +650,7 @@ async function waitForAssistantReply(params: {
   const currentDeadline = (): number => (Date.now() < deadline ? deadline : params.absoluteCeiling);
 
   while (Date.now() < generationStartDeadline) {
+    touchTaskHeartbeat("running");
     const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
       sawGenerating = true;
@@ -538,6 +674,7 @@ async function waitForAssistantReply(params: {
   }
 
   while (Date.now() < params.absoluteCeiling) {
+    touchTaskHeartbeat("running");
     const operationDeadline = currentDeadline();
     const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], operationDeadline);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
@@ -800,28 +937,62 @@ async function askCommand(args: string[]): Promise<number> {
     return 2;
   }
 
+  if (!isBackgroundWorker()) {
+    const activeBackground = findActiveTask();
+    if (activeBackground && !parsed.force) {
+      log(`active gpt-pro background task exists: ${activeBackground.task.taskId || activeBackground.filePath}`);
+      printTaskCompact(activeBackground.task, activeBackground.filePath);
+      log(`Use gpt-pro poll/collect --task-id ${activeBackground.task.taskId || "<id>"}, or pass --force to discard it.`);
+      return 2;
+    }
+    if (activeBackground && parsed.force) {
+      patchTaskFile(activeBackground.filePath, { status: "stale", finishedAt: Date.now(), lastError: "superseded by foreground ask --force" });
+    }
+  }
+
   const existing = readTask();
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-  // ponytail: stale-lock cleanup — if the recorded pid died, the task crashed; clear and proceed rather than dead-waiting 2h.
-  if (existing && existing.status !== "completed" && !isPidAlive(existing.pid)) {
-    const ageMin = Math.round((Date.now() - existing.sentAt) / 60000);
-    log(`stale gpt-pro task found (status=${existing.status}, started ${ageMin}m ago, pid ${existing.pid ?? "unknown"} no longer alive). Clearing lock.`);
+  const sameBackgroundTask = isBackgroundWorker() && existing?.taskId && existing.taskId === process.env.GPT_PRO_TASK_ID;
+  const existingAgeMs = existing ? Date.now() - (existing.sentAt || existing.createdAt || Date.now()) : 0;
+  const existingRecoverable = Boolean(
+    existing &&
+    existing.status !== "completed" &&
+    existing.status !== "failed" &&
+    (existing.conversationUrl || !isTerminalTaskStatus(existing.status))
+  );
+  // ponytail: stale-lock cleanup — if the recorded pid died before ChatGPT assigned a conversation URL,
+  // clear and proceed. If a URL exists, do NOT re-ask; continue/poll the same conversation to protect Pro quota.
+  if (!sameBackgroundTask && existingRecoverable && !isPidAlive(existing?.pid) && !existing?.conversationUrl && !isTerminalTaskStatus(existing?.status)) {
+    const ageMin = Math.round(existingAgeMs / 60000);
+    log(`stale gpt-pro task found (status=${existing?.status}, started ${ageMin}m ago, pid ${existing?.pid ?? "unknown"} no longer alive). Clearing lock.`);
     clearTask();
-  } else if (existing && existing.status !== "completed" && Date.now() - existing.sentAt < TWO_HOURS_MS && !parsed.force) {
-    const ageMin = Math.round((Date.now() - existing.sentAt) / 60000);
-    log(`unfinished gpt-pro task found (status=${existing.status}, started ${ageMin}m ago, url=${existing.conversationUrl}).`);
-    log(`Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
+  } else if (!sameBackgroundTask && existingRecoverable && existingAgeMs < TWO_HOURS_MS && !parsed.force) {
+    const ageMin = Math.round(existingAgeMs / 60000);
+    log(`unfinished gpt-pro task found (status=${existing?.status}, started ${ageMin}m ago, url=${existing?.conversationUrl || "pending"}).`);
+    log(existing?.taskId ? `Resume it with: gpt-pro start continue --task-id ${existing.taskId} [--timeout <sec>] [--out <file>]` : `Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
     log(`Or pass --force to ask to discard it and start a new conversation.`);
     log(`Do NOT re-run ask for the same prompt — that opens a new conversation and wastes the already-spent generation time.`);
     return 2;
   }
-  if (existing && parsed.force) {
+  if (!sameBackgroundTask && existing && parsed.force) {
     log("--force: discarding unfinished gpt-pro task.");
     clearTask();
   }
 
   let deadline = Date.now() + parsed.timeoutSec * 1000;
   const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
+  if (isBackgroundWorker()) {
+    patchTask({
+      status: "starting",
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      startedAt: Date.now(),
+      timeoutSec: parsed.timeoutSec,
+      deadlineAt: deadline,
+      absoluteCeilingAt: absoluteCeiling,
+      outPath: absolutePathMaybe(parsed.out),
+    });
+  }
   try {
     const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
     if (!isBridgeConnected(doctor)) {
@@ -891,15 +1062,25 @@ async function askCommand(args: string[]): Promise<number> {
       }
     }
     if (conversationUrl) {
+      const previousTask = readTask();
       writeTask({
+        ...(previousTask || {}),
+        schemaVersion: previousTask?.schemaVersion || (isBackgroundWorker() ? 2 : 1),
+        taskId: previousTask?.taskId || process.env.GPT_PRO_TASK_ID,
+        command: previousTask?.command || "ask",
         conversationUrl,
         conversationId,
         prompt: parsed.prompt,
+        files: parsed.files,
         baselineCount,
         sentAt: Date.now(),
+        submittedAt: Date.now(),
         heartbeatAt: Date.now(),
         pid: process.pid,
-        status: "generating",
+        status: "running",
+        timeoutSec: parsed.timeoutSec,
+        outPath: absolutePathMaybe(parsed.out) || previousTask?.outPath,
+        resultPath: absolutePathMaybe(parsed.out) || previousTask?.resultPath,
       });
     } else {
       log("warning: could not extract conversation /c/<id> URL; resume via `gpt-pro continue` will be unavailable for this dispatch.");
@@ -917,8 +1098,10 @@ async function askCommand(args: string[]): Promise<number> {
       const task = readTask();
       if (task) {
         task.status = "completed";
+        task.finishedAt = Date.now();
+        task.exitCode = 0;
         writeTask(task);
-        clearTask();
+        if (!isBackgroundWorker()) clearTask();
       }
       return 0;
     }
@@ -931,6 +1114,9 @@ async function askCommand(args: string[]): Promise<number> {
     if (task) {
       task.status = "timed-out";
       task.partialText = outcome.text || "";
+      task.partialPath = absolutePathMaybe(parsed.out) || task.partialPath;
+      task.finishedAt = Date.now();
+      task.exitCode = outcome.text ? 0 : 2;
       writeTask(task);
       if (task.conversationUrl) {
         log(`gpt-pro: timed out. Conversation preserved at ${task.conversationUrl}.`);
@@ -1000,6 +1186,18 @@ async function continueCommand(args: string[]): Promise<number> {
 
   let deadline = Date.now() + timeoutSec * 1000;
   const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
+  if (isBackgroundWorker()) {
+    patchTask({
+      status: "starting",
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      startedAt: Date.now(),
+      timeoutSec,
+      deadlineAt: deadline,
+      absoluteCeilingAt: absoluteCeiling,
+      outPath: absolutePathMaybe(out),
+    });
+  }
   try {
     const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
     if (!isBridgeConnected(doctor)) {
@@ -1027,8 +1225,12 @@ async function continueCommand(args: string[]): Promise<number> {
     log(`resuming gpt-pro conversation ${conversationUrl} (baseline assistant count ${baselineCount}${prevPartial ? ", has prior partial" : ""}).`);
 
     if (task) {
-      task.status = "generating";
+      task.status = "running";
       task.baselineCount = baselineCount;
+      task.pid = process.pid;
+      task.heartbeatAt = Date.now();
+      task.timeoutSec = timeoutSec;
+      task.outPath = absolutePathMaybe(out) || task.outPath;
       writeTask(task);
     }
 
@@ -1044,8 +1246,10 @@ async function continueCommand(args: string[]): Promise<number> {
       const t = readTask();
       if (t) {
         t.status = "completed";
+        t.finishedAt = Date.now();
+        t.exitCode = 0;
         writeTask(t);
-        clearTask();
+        if (!isBackgroundWorker()) clearTask();
       }
       return 0;
     }
@@ -1060,6 +1264,9 @@ async function continueCommand(args: string[]): Promise<number> {
     if (t) {
       t.status = "timed-out";
       t.partialText = outcome.text || "";
+      t.partialPath = absolutePathMaybe(out) || t.partialPath;
+      t.finishedAt = Date.now();
+      t.exitCode = outcome.text ? 0 : 2;
       writeTask(t);
       log(`gpt-pro: timed out on resume. Conversation preserved at ${t.conversationUrl}.`);
       log(`Resume again with: gpt-pro continue (via codex_bridge). Do NOT re-run ask.`);
@@ -1069,6 +1276,418 @@ async function continueCommand(args: string[]): Promise<number> {
     log(error instanceof Error ? error.message : String(error));
     return 2;
   }
+}
+
+function optionValue(args: string[], option: string): string | undefined {
+  const index = args.indexOf(option);
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  return value && !value.startsWith("--") ? value : undefined;
+}
+
+function hasOption(args: string[], option: string): boolean {
+  return args.includes(option);
+}
+
+function withoutOptions(args: string[], options: Set<string>): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (options.has(arg)) {
+      if (args[i + 1] && !args[i + 1].startsWith("--")) i += 1;
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+function ensureOption(args: string[], option: string, value: string): string[] {
+  return optionValue(args, option) ? args : [...args, option, value];
+}
+
+function defaultResultPath(taskId: string): string {
+  return path.join(pluginDataDir(), "gpt-pro", "results", `${safeTaskId(taskId)}.txt`);
+}
+
+function defaultLogPath(taskId: string): string {
+  return path.join(pluginDataDir(), "gpt-pro", "logs", `${safeTaskId(taskId)}.log`);
+}
+
+function newTaskId(): string {
+  return `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+}
+
+function writeLatestTaskPointer(taskId: string, filePath: string): void {
+  writeTaskFile(latestTaskPointerPath(), { schemaVersion: 2, taskId, status: "running", resultPath: filePath, updatedAt: Date.now() } as GptProTask);
+}
+
+function acquireStartLock(): () => void {
+  const filePath = startLockPath();
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const open = (): number => openSync(filePath, "wx");
+  let fd: number;
+  try {
+    fd = open();
+  } catch (error: any) {
+    if (error?.code === "EEXIST") {
+      try {
+        const ageMs = Date.now() - statSync(filePath).mtimeMs;
+        if (ageMs > 30_000) {
+          unlinkSync(filePath);
+          fd = open();
+        } else {
+          throw new Error("another gpt-pro start is already acquiring the singleton worker lock");
+        }
+      } catch (inner: any) {
+        if (inner?.message) throw inner;
+        throw new Error("another gpt-pro start is already acquiring the singleton worker lock");
+      }
+    } else {
+      throw error;
+    }
+  }
+  try { writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`); } catch {}
+  return () => {
+    try { closeSync(fd); } catch {}
+    try { unlinkSync(filePath); } catch {}
+  };
+}
+
+function latestTaskFile(): string | null {
+  const pointer = readTaskFile(latestTaskPointerPath());
+  if (pointer?.taskId) {
+    const filePath = taskPathForId(pointer.taskId);
+    if (existsSync(filePath)) return filePath;
+  }
+  try {
+    const files = readdirSync(taskDir())
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(taskDir(), name))
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    return files[0] || null;
+  } catch {
+    return existsSync(legacyTaskPath()) ? legacyTaskPath() : null;
+  }
+}
+
+function resolveTaskFileFromArgs(args: string[]): string | null {
+  const explicitFile = optionValue(args, "--task-file");
+  if (explicitFile) return absolutePathMaybe(explicitFile)!;
+  const taskId = optionValue(args, "--task-id");
+  if (taskId) return taskPathForId(taskId);
+  return latestTaskFile();
+}
+
+function refreshTaskStatus(filePath: string, task: GptProTask): GptProTask {
+  if (isTerminalTaskStatus(task.status)) return task;
+  const now = Date.now();
+  const heartbeatAgeMs = task.heartbeatAt ? now - task.heartbeatAt : Number.POSITIVE_INFINITY;
+  const ageMs = now - (task.updatedAt || task.createdAt || task.startedAt || now);
+  const pidDead = task.pid ? !isPidAlive(task.pid) : ageMs > 30_000;
+  const heartbeatStale = heartbeatAgeMs > 10 * 60 * 1000 && pidDead;
+  if (pidDead || heartbeatStale) {
+    return patchTaskFile(filePath, {
+      status: "stale",
+      finishedAt: now,
+      lastError: `background worker not alive${task.pid ? ` (pid ${task.pid})` : ""}`,
+    });
+  }
+  return task;
+}
+
+function allTaskFiles(): string[] {
+  try {
+    return readdirSync(taskDir())
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(taskDir(), name));
+  } catch {
+    return [];
+  }
+}
+
+function findActiveTask(): { filePath: string; task: GptProTask } | null {
+  for (const filePath of allTaskFiles()) {
+    const task = readTaskFile(filePath);
+    if (!task) continue;
+    const refreshed = refreshTaskStatus(filePath, task);
+    if (!isTerminalTaskStatus(refreshed.status)) return { filePath, task: refreshed };
+  }
+  return null;
+}
+
+function printTaskCompact(task: GptProTask, filePath: string, includeSummary = true): void {
+  const heartbeatAge = task.heartbeatAt ? Math.max(0, Math.round((Date.now() - task.heartbeatAt) / 1000)) : undefined;
+  printLine("TASK_ID", task.taskId);
+  printLine("STATUS", task.status);
+  printLine("TASK_FILE", filePath);
+  printLine("RESULT_FILE", task.resultPath || task.outPath);
+  printLine("PARTIAL_FILE", task.partialPath);
+  printLine("LOG_FILE", task.logPath);
+  printLine("CONVERSATION_URL", task.conversationUrl);
+  printLine("PID", task.pid);
+  printLine("HEARTBEAT_AGE_SEC", heartbeatAge);
+  if (includeSummary) printLine("SUMMARY", task.summary || (task.partialText ? summarizeTaskText(task.partialText) : undefined));
+  printLine("ERROR", task.lastError);
+}
+
+function parseStartContinueArgs(args: string[]): { url?: string; taskId?: string; out?: string; timeoutSec: number } {
+  const timeoutValue = optionValue(args, "--timeout");
+  const timeoutSec = timeoutValue ? Number(timeoutValue) : 900;
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout must be a positive number of seconds");
+  return {
+    url: optionValue(args, "--url"),
+    taskId: optionValue(args, "--task-id"),
+    out: optionValue(args, "--out"),
+    timeoutSec,
+  };
+}
+
+function spawnDetachedWorker(params: { mode: "ask" | "continue"; args: string[]; taskId: string; taskFile: string; logPath: string }): number {
+  mkdirSync(path.dirname(params.logPath), { recursive: true });
+  const fd = openSync(params.logPath, "a");
+  const scriptPath = new URL(import.meta.url).pathname;
+  const entry = process.env.GPT_PRO_TEST_FAKE_WORKER === "1" ? "__fake-worker" : "__worker";
+  const child = spawn(process.execPath, ["--experimental-strip-types", scriptPath, entry, params.mode, ...params.args], {
+    detached: true,
+    stdio: ["ignore", fd, fd],
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      GPT_PRO_TASK_FILE: params.taskFile,
+      GPT_PRO_TASK_ID: params.taskId,
+      GPT_PRO_BACKGROUND_WORKER: "1",
+    },
+  });
+  closeSync(fd);
+  child.unref();
+  return child.pid || 0;
+}
+
+async function startCommand(args: string[]): Promise<number> {
+  const [mode, ...rest] = args;
+  if (mode !== "ask" && mode !== "continue") {
+    log("gpt_pro.ts start requires ask or continue");
+    log(usage());
+    return 2;
+  }
+
+  let releaseStartLock: (() => void) | undefined;
+  try {
+    releaseStartLock = acquireStartLock();
+    const force = hasOption(rest, "--force");
+    const active = findActiveTask();
+    if (active && !force) {
+      log(`active gpt-pro background task exists: ${active.task.taskId || active.filePath}`);
+      printTaskCompact(active.task, active.filePath);
+      return 2;
+    }
+    if (active && force) {
+      patchTaskFile(active.filePath, { status: "stale", finishedAt: Date.now(), lastError: "superseded by start --force" });
+    }
+
+    const legacyTask = mode === "ask" ? readTaskFile(legacyTaskPath()) : null;
+    const legacyAgeMs = legacyTask ? Date.now() - (legacyTask.sentAt || legacyTask.createdAt || Date.now()) : 0;
+    const legacyRecoverable = Boolean(
+      legacyTask &&
+      legacyTask.status !== "completed" &&
+      legacyTask.status !== "failed" &&
+      legacyTask.conversationUrl &&
+      legacyAgeMs < 2 * 60 * 60 * 1000
+    );
+    if (legacyRecoverable && !force) {
+      log(`recoverable legacy gpt-pro task exists: ${legacyTask!.conversationUrl}`);
+      printTaskCompact(legacyTask!, legacyTaskPath());
+      log(`Resume it with: gpt-pro start continue --url ${legacyTask!.conversationUrl} [--timeout <sec>] [--out <file>]`);
+      log(`Or pass --force to discard it and start a new conversation.`);
+      return 2;
+    }
+    if (legacyRecoverable && force) {
+      try { unlinkSync(legacyTaskPath()); } catch {}
+    }
+
+    let taskId = newTaskId();
+    let taskFile = taskPathForId(taskId);
+    let workerArgs = [...rest];
+    let outPath = optionValue(rest, "--out");
+    let timeoutSec = 900;
+    let prompt = "";
+    let promptFile: string | undefined;
+    let files: string[] = [];
+    let conversationUrl: string | undefined;
+    let existingTask: GptProTask | null = null;
+
+    if (mode === "ask") {
+      const parsed = parseAskArgs(rest);
+      timeoutSec = parsed.timeoutSec;
+      prompt = parsed.prompt;
+      promptFile = optionValue(rest, "--prompt-file");
+      files = parsed.files;
+      if (!outPath) outPath = defaultResultPath(taskId);
+      workerArgs = ensureOption(workerArgs, "--out", outPath);
+    } else {
+      const parsed = parseStartContinueArgs(rest);
+      timeoutSec = parsed.timeoutSec;
+      if (parsed.taskId) {
+        taskId = safeTaskId(parsed.taskId);
+        taskFile = taskPathForId(taskId);
+        existingTask = readTaskFile(taskFile);
+        if (!existingTask) throw new Error(`unknown gpt-pro task id: ${taskId}`);
+        conversationUrl = parsed.url || existingTask.conversationUrl;
+        workerArgs = withoutOptions(workerArgs, new Set(["--task-id", "--force"]));
+      } else {
+        conversationUrl = parsed.url;
+      }
+      if (!conversationUrl) throw new Error("start continue requires --task-id for a saved task or --url <conversation-url>");
+      if (!outPath) outPath = existingTask?.outPath || existingTask?.resultPath || defaultResultPath(taskId);
+      workerArgs = ensureOption(withoutOptions(workerArgs, new Set(["--task-id", "--force"])), "--url", conversationUrl);
+      workerArgs = ensureOption(workerArgs, "--out", outPath);
+    }
+
+    const now = Date.now();
+    const logPath = existingTask?.logPath || defaultLogPath(taskId);
+    const initialTask: GptProTask = {
+      ...(existingTask || {}),
+      schemaVersion: 2,
+      taskId,
+      command: mode,
+      status: "starting",
+      createdAt: existingTask?.createdAt || now,
+      updatedAt: now,
+      startedAt: now,
+      heartbeatAt: now,
+      timeoutSec,
+      deadlineAt: now + timeoutSec * 1000,
+      absoluteCeilingAt: now + timeoutSec * 1000 + MAX_AUTO_EXTEND_MS,
+      prompt,
+      promptFile,
+      files,
+      conversationUrl: conversationUrl || existingTask?.conversationUrl,
+      outPath: absolutePathMaybe(outPath),
+      resultPath: absolutePathMaybe(outPath),
+      logPath,
+    };
+    writeTaskFile(taskFile, initialTask);
+    const pid = spawnDetachedWorker({ mode, args: workerArgs, taskId, taskFile, logPath });
+    const startedTask = patchTaskFile(taskFile, { pid, heartbeatAt: Date.now(), startedAt: Date.now() });
+    writeLatestTaskPointer(taskId, taskFile);
+
+    printTaskCompact(startedTask, taskFile, false);
+    printLine("POLL_CMD", `gpt-pro poll --task-id ${taskId}`);
+    printLine("COLLECT_CMD", `gpt-pro collect --task-id ${taskId}`);
+    printLine("CANCEL_CMD", `gpt-pro cancel --task-id ${taskId}`);
+    return 0;
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error));
+    return 2;
+  } finally {
+    if (releaseStartLock) releaseStartLock();
+  }
+}
+
+async function workerCommand(args: string[]): Promise<number> {
+  const [mode, ...rest] = args;
+  if (mode !== "ask" && mode !== "continue") {
+    log("internal worker requires ask or continue");
+    return 2;
+  }
+  patchTask({ status: "starting", pid: process.pid, heartbeatAt: Date.now(), startedAt: Date.now() });
+  let code = 2;
+  try {
+    code = mode === "ask" ? await askCommand(rest) : await continueCommand(rest);
+    const task = readTask();
+    if (task && !isTerminalTaskStatus(task.status)) {
+      patchTask({ status: code === 0 ? "completed" : "failed", finishedAt: Date.now(), exitCode: code });
+    } else if (task) {
+      patchTask({ exitCode: code, finishedAt: task.finishedAt || Date.now() });
+    }
+    return code;
+  } catch (error) {
+    patchTask({ status: "failed", lastError: error instanceof Error ? error.message : String(error), finishedAt: Date.now(), exitCode: 2 });
+    return 2;
+  }
+}
+
+async function fakeWorkerCommand(args: string[]): Promise<number> {
+  const [mode, ...rest] = args;
+  const delayMs = Number(process.env.GPT_PRO_FAKE_DELAY_MS || "100");
+  const out = absolutePathMaybe(optionValue(rest, "--out") || readTask()?.outPath || defaultResultPath(process.env.GPT_PRO_TASK_ID || "fake"))!;
+  patchTask({ status: "running", command: mode === "continue" ? "continue" : "ask", pid: process.pid, heartbeatAt: Date.now(), outPath: out, resultPath: out });
+  await new Promise((resolve) => setTimeout(resolve, Number.isFinite(delayMs) ? delayMs : 100));
+  if (isTerminalTaskStatus(readTask()?.status) && readTask()?.status !== "completed") return 0;
+  mkdirSync(path.dirname(out), { recursive: true });
+  const text = `fake gpt-pro ${mode || "ask"} result at ${new Date().toISOString()}`;
+  writeFileSync(out, text, "utf8");
+  patchTask({ status: "completed", finishedAt: Date.now(), heartbeatAt: Date.now(), resultPath: out, partialPath: out, partialText: text, summary: summarizeTaskText(text), exitCode: 0 });
+  return 0;
+}
+
+function signalTaskProcess(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid || pid <= 0 || pid === process.pid) return;
+  try { process.kill(-pid, signal); } catch {}
+  try { process.kill(pid, signal); } catch {}
+}
+
+async function pollCommand(args: string[]): Promise<number> {
+  const filePath = resolveTaskFileFromArgs(args);
+  if (!filePath) {
+    log("no gpt-pro task found");
+    return 2;
+  }
+  const task = readTaskFile(filePath);
+  if (!task) {
+    log(`could not read gpt-pro task: ${filePath}`);
+    return 2;
+  }
+  printTaskCompact(refreshTaskStatus(filePath, task), filePath);
+  return 0;
+}
+
+async function collectCommand(args: string[]): Promise<number> {
+  const filePath = resolveTaskFileFromArgs(args);
+  if (!filePath) {
+    log("no gpt-pro task found");
+    return 2;
+  }
+  const task = readTaskFile(filePath);
+  if (!task) {
+    log(`could not read gpt-pro task: ${filePath}`);
+    return 2;
+  }
+  const refreshed = refreshTaskStatus(filePath, task);
+  printTaskCompact(refreshed, filePath, false);
+  const resultPath = refreshed.resultPath || refreshed.outPath;
+  const partialPath = refreshed.partialPath || resultPath;
+  if (refreshed.status === "completed" && resultPath && existsSync(resultPath)) {
+    printLine("SUMMARY", summarizeTaskText(readFileSync(resultPath, "utf8")));
+    return 0;
+  }
+  if ((refreshed.status === "timed-out" || refreshed.status === "stale" || refreshed.status === "failed" || refreshed.status === "cancelled") && hasOption(args, "--partial") && partialPath && existsSync(partialPath)) {
+    printLine("PARTIAL_FILE", partialPath);
+    printLine("SUMMARY", summarizeTaskText(readFileSync(partialPath, "utf8")));
+    return 0;
+  }
+  return refreshed.status === "failed" ? 2 : 0;
+}
+
+async function cancelCommand(args: string[]): Promise<number> {
+  const filePath = resolveTaskFileFromArgs(args);
+  if (!filePath) {
+    log("no gpt-pro task found");
+    return 2;
+  }
+  const task = readTaskFile(filePath);
+  if (!task) {
+    log(`could not read gpt-pro task: ${filePath}`);
+    return 2;
+  }
+  if (!isTerminalTaskStatus(task.status)) {
+    patchTaskFile(filePath, { status: "cancelled", finishedAt: Date.now(), lastError: "cancelled by user", exitCode: null });
+    signalTaskProcess(task.pid, "SIGTERM");
+  }
+  const cancelled = readTaskFile(filePath) || task;
+  printTaskCompact(cancelled, filePath, false);
+  return 0;
 }
 
 async function main(): Promise<number> {
@@ -1081,6 +1700,30 @@ async function main(): Promise<number> {
 
   if (command === "status") {
     return await statusCommand();
+  }
+
+  if (command === "start") {
+    return await startCommand(args);
+  }
+
+  if (command === "poll") {
+    return await pollCommand(args);
+  }
+
+  if (command === "collect") {
+    return await collectCommand(args);
+  }
+
+  if (command === "cancel") {
+    return await cancelCommand(args);
+  }
+
+  if (command === "__worker") {
+    return await workerCommand(args);
+  }
+
+  if (command === "__fake-worker") {
+    return await fakeWorkerCommand(args);
   }
 
   if (command === "continue") {
@@ -1101,6 +1744,14 @@ function installSignalFlush(): void {
   const handler = (sig: NodeJS.Signals) => {
     if (pendingPartial?.text) {
       flushPartial(pendingPartial.text, pendingPartial.out);
+    }
+    const task = readTask();
+    if (task && !isTerminalTaskStatus(task.status)) {
+      task.status = pendingPartial?.text ? "timed-out" : "stale";
+      task.lastError = `received ${sig}`;
+      task.finishedAt = Date.now();
+      task.exitCode = 0;
+      writeTask(task);
     }
     process.exit(0);
   };

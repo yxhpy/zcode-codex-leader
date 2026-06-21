@@ -142,9 +142,10 @@ Once installed, ZCode operates in a strict dispatch loop:
    node --experimental-strip-types "$PLUGIN_ROOT/scripts/codex_bridge.ts" ask "write a Python merge sort"
    ```
 3. **Use deterministic `exec` for commands** like build/test/install/git/cache when no model reasoning is needed; use `--external --approved` only after user approval for deploy/push/paid/external side effects.
-4. **Ingest & judge** each compact result — accept, reject, or mark stale. Read the `RESULT_FILE` artifact only when needed for verification.
-5. **Verify** the final state with read-only checks.
-6. **Report** with a `Plugin evidence:` line per dispatched capability (copied from the bridge output).
+4. **Use GPT-Pro background tasks for long Pro work**: `gpt-pro start ask ...` returns `TASK_ID`/`TASK_FILE`/`RESULT_FILE`, then `gpt-pro poll` / `gpt-pro collect` / `gpt-pro cancel` synchronize without blocking on the Bash 600s ceiling.
+5. **Ingest & judge** each compact result — accept, reject, or mark stale. Read the `RESULT_FILE` artifact only when needed for verification.
+6. **Verify** the final state with read-only checks.
+7. **Report** with a `Plugin evidence:` line per dispatched capability (copied from the bridge output).
 
 Trying to `Edit`/`Write`/`rm`/`git commit` directly hits the gate:
 ```
@@ -163,7 +164,7 @@ zcode-codex-leader/
 │   ├── hooks/hooks.json                  # 4 hook event registrations
 │   ├── scripts/
 │   │   ├── leader_hook.ts                # hook entry (session-start/pre-tool-use/user-prompt-submit/stop)
-│   │   ├── codex_bridge.ts               # dispatch channel (ask/vision/generate-image/mcp-tool)
+│   │   ├── codex_bridge.ts               # dispatch channel (auto/ask/exec/gpt-pro/vision/generate-image/mcp-tool)
 │   │   ├── app_server_pool.ts            # resident worker management (ws transport)
 │   │   └── constitution.ts               # leader constitution text
 │   └── skills/codex-leader/SKILL.md      # usage skill auto-loaded by the agent
@@ -175,6 +176,9 @@ zcode-codex-leader/
 State lives in `$PLUGIN_DATA` (default `~/.codex/zcode-codex-leader-data/`):
 - `session.json` — resident worker pid, WebSocket URL, dispatch count.
 - `gen-<ts>.png` — generated images (unless `--out` is given).
+- `gpt-pro/tasks/<task-id>.json` — durable GPT-Pro background task metadata.
+- `gpt-pro/results/<task-id>.txt` — GPT-Pro full/partial answer artifacts.
+- `gpt-pro/logs/<task-id>.log` — detached GPT-Pro worker stdout/stderr logs.
 
 To force-restart the worker: delete `session.json` (or kill the `codex app-server --listen ws://127.0.0.1:0` process); it self-heals on the next dispatch.
 
