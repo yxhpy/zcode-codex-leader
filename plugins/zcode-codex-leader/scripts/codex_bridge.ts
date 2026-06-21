@@ -7,6 +7,11 @@
 //       and JSON-Schema-constrained structured output.
 //   ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
 //       Like ask, but reads the prompt from a file and writes the full result to a file.
+//   parse <file> [question] [--out <path>] [--tier <t>] [--model <m>] [--effort <e>]
+//       Read a source file and answer a question about it. Replaces the leader
+//       reading code directly. Omit question for a default purpose/exports summary.
+//   web <query> [--out <path>] [--depth 1-5] [--tier <t>] [--model <m>] [--effort <e>]
+//       Web research via the resident worker's webSearch. Replaces WebSearch/WebFetch.
 //   vision <image-path> <question>
 //       Visual understanding of a local image.
 //   generate-image <prompt> [--out <path>] [--timeout <sec>]
@@ -124,6 +129,70 @@ async function cmdAsk(positional: string[], flags: Record<string, string>): Prom
   // print agent messages (the actual answer)
   for (const m of r.messages) process.stdout.write(m + "\n");
   process.stdout.write(`Plugin evidence: ask via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + (r.model ? ",model=" + r.model : "") + "]" : ""}\n`);
+}
+
+// parse: read a source file and answer a question about it. Replaces the leader
+// reading code directly. The file body is fed as fenced text input so the worker
+// never has to re-read it (the leader already can't, and the worker's cwd may
+// differ). Default question summarizes purpose/exports/key logic.
+async function cmdParse(positional: string[], flags: Record<string, string>): Promise<void> {
+  const filePath = positional[0];
+  if (!filePath || !existsSync(filePath)) fail(`parse requires an existing <file>: ${filePath || "(missing)"}`);
+  const question = positional.slice(1).join(" ").trim()
+    || "Summarize this file: its purpose, public exports/symbols, and the key logic a maintainer needs to know. Be concrete and reference symbol names.";
+  const body = readFileSync(filePath, "utf8");
+  const lang = (filePath.toLowerCase().split(".").pop() || "") || "";
+  const input: any[] = [{
+    type: "text",
+    text: `${question}\n\n--- FILE: ${filePath} ---\n\`\`\`${lang}\n${body}\n\`\`\`\n\nAnswer the question above using only this file. If the file is too large to fully parse, focus on the public surface (exports, signatures, top-level structure) and say so.`,
+  }];
+  const opts: any = { tier: flags.tier || "balanced", taskKind: "parse" };
+  if (flags.model) opts.model = flags.model;
+  if (flags.effort) opts.effort = flags.effort;
+
+  const r = await runTurn(input, opts);
+  bumpDispatch();
+  const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
+  if (text.length > 800 || flags.out) {
+    const outPath = flags.out || path.join(pluginDataDir(), `parse-${Date.now()}.txt`);
+    writeFileSync(outPath, text, "utf8");
+    const summary = text.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
+    process.stdout.write(outPath + "\n");
+    process.stdout.write((summary || text) + "\n");
+  } else {
+    process.stdout.write(text + "\n");
+  }
+  process.stdout.write(`Plugin evidence: parse via codex_bridge.ts — turn ${r.turnId} on ${filePath}${r.tier ? " [tier=" + r.tier + "]" : ""}\n`);
+}
+
+// web: web research via the resident worker's webSearch capability. The leader's
+// own WebSearch/WebFetch are gate-blocked; this is the only web path.
+async function cmdWeb(positional: string[], flags: Record<string, string>): Promise<void> {
+  const query = positional.join(" ").trim();
+  if (!query) fail("web requires a <query>");
+  const depth = flags.depth ? Number(flags.depth) : 1;
+  if (!Number.isFinite(depth) || depth < 1 || depth > 5) fail(`invalid --depth (1-5): ${flags.depth}`);
+  const input: any[] = [{
+    type: "text",
+    text: `Research this and report findings with source URLs. Search depth: ${depth} (1=quick lookup, 3=thorough, 5=exhaustive). Query: ${query}\n\nUse web search as needed. Cite each fact with its source URL. If you cannot reach the web, say so explicitly instead of guessing.`,
+  }];
+  const opts: any = { tier: flags.tier || "balanced", taskKind: "summary" };
+  if (flags.model) opts.model = flags.model;
+  if (flags.effort) opts.effort = flags.effort;
+
+  const r = await runTurn(input, opts);
+  bumpDispatch();
+  const text = r.messages.join("\n").trim() || "(no agentMessage text returned)";
+  if (text.length > 800 || flags.out) {
+    const outPath = flags.out || path.join(pluginDataDir(), `web-${Date.now()}.txt`);
+    writeFileSync(outPath, text, "utf8");
+    const summary = text.split(/\s+/).filter(Boolean).slice(0, 120).join(" ");
+    process.stdout.write(outPath + "\n");
+    process.stdout.write((summary || text) + "\n");
+  } else {
+    process.stdout.write(text + "\n");
+  }
+  process.stdout.write(`Plugin evidence: web via codex_bridge.ts — turn ${r.turnId}${r.tier ? " [tier=" + r.tier + "]" : ""}\n`);
 }
 
 // ask-file: code generation / parsing with file-based prompt and result output
@@ -396,6 +465,8 @@ async function main(): Promise<void> {
   switch (sub) {
     case "ask":            return cmdAsk(positional, flags);
     case "ask-file":       return cmdAskFile(positional, flags);
+    case "parse":          return cmdParse(positional, flags);
+    case "web":            return cmdWeb(positional, flags);
     case "vision":         return cmdVision(positional, flags);
     case "generate-image": return cmdGenerateImage(positional, flags);
     case "test":           return cmdTest(positional, flags);
@@ -419,6 +490,13 @@ Usage:
   codex_bridge ask <prompt> [--image <path>] [--detail auto|low|high|original] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
   codex_bridge ask-file <prompt-file> [--out <result-file>] [--image <path>] [--model <m>] [--effort <e>] [--output-schema <file.json>] [--tier <fast|balanced|strong>] [--task-kind <type>]
       Like ask, but reads the prompt from a file and writes the full result to a file. stdout shows only the result path + evidence. Saves leader context tokens.
+  codex_bridge parse <file> [question] [--out <path>] [--tier <t>] [--model <m>] [--effort <e>]
+      Read a source file and answer a question about it. Replaces the leader
+      reading code directly. Omit question for a default purpose/exports summary.
+      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
+  codex_bridge web <query> [--out <path>] [--depth 1-5] [--tier <t>] [--model <m>] [--effort <e>]
+      Web research via the resident worker's webSearch. Replaces WebSearch/WebFetch.
+      Output >800 chars is written to --out (or a temp file); stdout shows path + summary.
   codex_bridge vision <image-path> <question> [--detail auto|low|high|original]
   codex_bridge generate-image <prompt> [--out <path>] [--timeout <sec>]
   codex_bridge test <prompt> [-- <test-cmd>] [--browser] [--full-access] [--out <file>] [--timeout <sec>] [--tier <t>]

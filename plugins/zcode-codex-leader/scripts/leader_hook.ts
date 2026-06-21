@@ -61,13 +61,60 @@ function onSessionStart(): void {
 // Tool names observed in this harness: Read, Glob, Grep, Bash, Edit, Write,
 // NotebookEdit, TodoWrite, WebFetch, Task/Agent. We block write-class tools and
 // write-class Bash, allow everything read-only plus the bridge dispatch channel.
-const READONLY_TOOLS = new Set(["Read", "Glob", "Grep", "TodoWrite", "WebFetch", "Task", "Agent"]);
+// Read is gated by file extension below (image/code/text-allowlist), so it is
+// NOT in this blanket-allow set. WebFetch/WebSearch are blocked — web research
+// is dispatched to codex_bridge.ts web.
+const READONLY_TOOLS = new Set(["Glob", "Grep", "TodoWrite", "Task", "Agent"]);
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "NotebookEditDeleteCells"]);
+
+// Web tools: leader must not fetch the web itself. Dispatched via codex_bridge web.
+const WEB_TOOLS = new Set(["WebSearch", "WebFetch"]);
 
 // Image files that the Read tool renders visually to the model. Reading these
 // is visual understanding, which the leader must dispatch to codex_bridge.ts
 // vision — never ingest directly.
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff", "tif", "avif", "heic", "heif"]);
+
+// Source-code files. Reading these is code understanding, which the leader
+// must dispatch to codex_bridge.ts parse — never ingest directly. Covers the
+// common compiled/script/markup/stylesheet languages; unusual extensions fall
+// through to the text-allowlist check below.
+const CODE_EXTENSIONS = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts",
+  "py", "pyi", "pyw",
+  "go", "rs", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx",
+  "java", "kt", "kts", "scala", "sc",
+  "cs", "rb", "php", "swift", "dart",
+  "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
+  "sql", "graphql", "gql",
+  "html", "htm", "css", "scss", "sass", "less", "styl",
+  "vue", "svelte", "astro",
+  "lua", "r", "jl",
+  "clj", "cljs", "cljc", "elm", "hs", "lhs", "ml", "mli", "fs", "fsi", "fsx",
+  "ex", "exs", "erl", "lisp", "cl", "scm",
+  "zig", "nim", "v", "d",
+  "asm", "s",
+  "proto", "thrift",
+]);
+
+// Text/config/doc files the leader MAY Read directly (planning, results, status,
+// verification of config). Anything not in CODE_EXTENSIONS/IMAGE_EXTENSIONS and
+// not here is treated as non-allowlisted text and routed to parse too.
+const TEXT_ALLOWLIST = new Set([
+  "md", "markdown", "mdx",
+  "txt", "text", "log", "logs",
+  "json", "jsonc", "json5",
+  "yaml", "yml",
+  "toml", "ini", "cfg", "conf", "config", "properties",
+  "csv", "tsv",
+  "xml",
+  "env", "editorconfig", "gitignore", "gitattributes", "gitmodules",
+  "dockerignore", "npmignore", "prettierignore", "eslintignore",
+  "lock", "map",
+  "rst", "adoc", "tex", "org",
+  "diff", "patch",
+  "license", "licence", "authors", "contributors", "changes", "changelog", "news",
+]);
 
 // Bash commands that are effectively read-only and safe for the leader to run
 // directly (context gathering, verification). Anything else in Bash must go
@@ -81,17 +128,32 @@ function onPreToolUse(): void {
   // Field names are snake_case on the wire (tool_name / tool_input).
   const tool: string = input.tool_name || input.toolName || "";
   const toolInput: any = input.tool_input || input.toolInput || {};
+  const pluginRoot = process.env.PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT || process.cwd();
+  const bridgePath = `${pluginRoot}/scripts/codex_bridge.ts`;
 
-  // 1) Read-only tools: allow, EXCEPT Read on image files. The Read tool renders
-  //    images visually into the leader's context, which is visual understanding
-  //    and must be dispatched to codex_bridge.ts vision — never ingested directly.
+  // 0) Web tools: blocked. Web research is dispatched to codex_bridge.ts web.
+  if (WEB_TOOLS.has(tool)) {
+    const q: string = (tool === "WebSearch")
+      ? (toolInput.query || toolInput.question || toolInput.prompt || "")
+      : (toolInput.url || toolInput.prompt || toolInput.question || "");
+    const qArg = q ? ` "${q.replace(/"/g, '\\"')}"` : "";
+    block(`[Leader Gate] ${tool} is blocked. ZCode must not fetch the web directly — that is research, which is dispatched. Run: node --experimental-strip-types "${bridgePath}" web${qArg}. Reason: leader-only mode.`);
+  }
+
+  // 1) Read: gated by extension. Image→vision, code→parse, non-allowlisted→parse,
+  //    allowlisted docs/config→allow. The leader stays out of images AND source
+  //    code; it only reads docs/config/results it wrote or that are inert.
   if (tool === "Read") {
     const filePath: string = toolInput.file_path || toolInput.filePath || "";
     const ext = filePath.toLowerCase().split(".").pop() || "";
     if (IMAGE_EXTENSIONS.has(ext)) {
-      const pluginRoot = process.env.PLUGIN_ROOT || process.cwd();
-      const bridgePath = `${pluginRoot}/scripts/codex_bridge.ts`;
       block(`[Leader Gate] Read of image file is blocked: \`${filePath}\`. ZCode must not ingest images directly — that is visual understanding, which is dispatched. Run: node --experimental-strip-types "${bridgePath}" vision "${filePath}" "<your question>". Reason: leader-only mode.`);
+    }
+    if (CODE_EXTENSIONS.has(ext)) {
+      block(`[Leader Gate] Read of source file is blocked: \`${filePath}\`. ZCode must not read code directly — that is code understanding, which is dispatched. Run: node --experimental-strip-types "${bridgePath}" parse "${filePath}" "<your question, or omit for a default summary>". Reason: leader-only mode.`);
+    }
+    if (!TEXT_ALLOWLIST.has(ext)) {
+      block(`[Leader Gate] Read of \`${filePath}\` is blocked: extension \`.${ext}\` is not in the leader read-allowlist (docs/config only). If this is a text/config file, the allowlist may need extending; if it is code or a structured artifact, dispatch understanding to codex_bridge.ts parse: node --experimental-strip-types "${bridgePath}" parse "${filePath}". Reason: leader-only mode.`);
     }
     process.exit(0);
   }
@@ -105,8 +167,6 @@ function onPreToolUse(): void {
   // 3) Bash: allow only the bridge dispatch channel and read-only commands.
   if (tool === "Bash") {
     const cmd: string = typeof toolInput === "string" ? toolInput : (toolInput.command || "");
-    const pluginRoot = process.env.PLUGIN_ROOT || process.cwd();
-    const bridgePath = `${pluginRoot}/scripts/codex_bridge.ts`;
     // Allow the bridge dispatch channel (the leader's only implementation path).
     if (cmd.includes(bridgePath) || cmd.includes("codex_bridge.ts")) {
       process.exit(0);
