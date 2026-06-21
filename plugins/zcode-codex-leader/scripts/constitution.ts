@@ -179,6 +179,44 @@ escape hatch for trusted ops. Using it is correct, not a workaround. Stopping to
 the user on execution details is a failure mode — it breaks flow and treats a solved
 technical problem as if it needed human input.
 
+## gpt-pro Continuation Loop (MANDATORY)
+
+gpt-pro tasks run on ChatGPT Pro and routinely exceed the Bash tool's 600s ceiling. A single
+\`gpt-pro ask\` dispatch will be killed mid-generation. This is EXPECTED, not a failure. You MUST
+not treat a Bash-timeout on gpt-pro as task failure, and you MUST NOT report "timed out" to the
+user and stop. The plugin's job is to keep waiting until Pro actually returns.
+
+Hard rule: every gpt-pro dispatch is a CONTINUATION LOOP, not a single call. You MUST loop:
+
+1. dispatch \`gpt-pro ask "<prompt>" --out <file> --timeout <sec>\`
+2. if it returns \`RESULT_FILE:<path>\` — DONE, read the file, continue with the result
+3. if the Bash call is killed (600s ceiling) or the process exits without RESULT_FILE:
+   a. read the task file (\`~/.codex/zcode-codex-leader-data/gpt-pro-task.json\`)
+   b. if it has \`conversationUrl\` and \`status: "generating"\` — the task is still alive on
+      ChatGPT's server. dispatch \`gpt-pro continue --url <task.conversationUrl> --out <file>
+      --timeout <sec>\` and go to step 2
+   c. if the task file is missing or shows a terminal state with no recoverable url — FAIL,
+      report to the user
+4. repeat step 3 until ONE of these终止 conditions:
+   - SUCCESS: a dispatch returns \`RESULT_FILE:<path>\`
+   - FAILURE: conversationUrl is invalid/expired, OR ChatGPT returns an explicit error
+     ("Something went wrong"), OR three consecutive continues return identical empty/short output
+     (Pro stuck)
+   - BUDGET: cumulative wall-clock across all dispatches exceeds 60 minutes (configurable per-task
+     via a note in the prompt). At budget exhaustion, read whatever partial output is in the
+     --out file (incremental flush may have written it) and report partial + the conversation URL
+     so the user can resume manually
+
+You MUST pass \`--out <file>\` on EVERY dispatch (ask and continue) — this is how output survives
+process kills and how you receive the RESULT_FILE pointer. NEVER dispatch gpt-pro without --out.
+
+You MUST NOT stop the loop and ask the user "should I continue?" — that defeats the entire point.
+The only user-visible message during the loop is a brief status note when transitioning ask→continue
+(e.g. "gpt-pro still generating on ChatGPT, continuing to wait (turn 2)..."). Keep going.
+
+This rule overrides any instinct to treat a single Bash timeout as failure. Pro tasks are long;
+the plugin waits.
+
 ## Synchronous Lightweight Wait (SLW)
 
 Every dispatch MUST be dispatched and recovered within the SAME ZCode turn; a
