@@ -5,7 +5,7 @@
 // port is parsed from the worker's stderr and persisted to session.json. Clients
 // connect over WebSocket; the worker stays resident across calls.
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +24,78 @@ function codexBinary(): string {
 function killProcessGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
   try { process.kill(-pid, signal); } catch {}
   try { process.kill(pid, signal); } catch {}
+}
+
+// Probe whether a pid is alive (signal 0 = existence probe, no signal sent).
+// Closes the dual-process blind spot: codex worker = node launcher (pid A =
+// session.pid) + codex binary (pid B = the real WS server). If A dies but B
+// keeps serving WS, isAlive() still returns true — yet the worker's turn loop
+// is already wedged, so the next turn/start hangs. Checking pid A first lets
+// ensureServer fail fast and spawn a fresh worker.
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// Find leaked resident workers from previous crashed sessions. The worker
+// fingerprint is "app-server" + "--listen ws://127.0.0.1" + our feature-flag
+// cocktail; "features.goals=false" is unique to this plugin's workers, so other
+// codex app-server processes (Codex.app, VSCode, hermes login) never match.
+//
+// A worker is a dual process: launcher pid A + codex binary pid B (A's child,
+// same process group). Both match the fingerprint, so we spare the whole live
+// group: keepPid plus every pid whose ppid chain still reaches keepPid. When A
+// is dead, its B is reparented to init (ppid=1) and becomes a true orphan —
+// exactly what we want to reap. NOTE: assumes a single resident worker per
+// host; concurrent zcode sessions using this plugin would see each other's
+// worker as orphans.
+function listOrphanWorkers(keepPid: number | null): number[] {
+  let out = "";
+  try {
+    out = execSync("ps -eo pid=,ppid=,command=", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return [];
+  }
+  // Map pid -> ppid for live-process ancestry walks, and the matching worker
+  // pids (fingerprint hit) to spare/kill.
+  const ppidOf = new Map<number, number>();
+  const matched: number[] = [];
+  for (const line of out.split("\n")) {
+    if (!line.includes("app-server")) continue;
+    if (!line.includes("ws://127.0.0.1")) continue;
+    if (!line.includes("features.goals=false")) continue;
+    const parts = line.trim().split(/\s+/);
+    const pid = Number(parts[0]);
+    const ppid = Number(parts[1]);
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    if (Number.isFinite(ppid)) ppidOf.set(pid, ppid);
+    matched.push(pid);
+  }
+  // A pid is "live group" (spared) if keepPid is alive and the pid is keepPid
+  // itself or a descendant via the ppid chain. We rebuild ppidOf from ps each
+  // call, so a dead A simply won't appear as anyone's ancestor — its B (now
+  // ppid=1) is correctly classified as an orphan.
+  const liveGroup = new Set<number>();
+  if (keepPid !== null && isPidAlive(keepPid)) {
+    for (const pid of matched) {
+      let cur: number = pid;
+      const guard = new Set<number>();
+      while (Number.isFinite(cur) && cur > 0 && !guard.has(cur)) {
+        guard.add(cur);
+        if (cur === keepPid) { liveGroup.add(pid); break; }
+        cur = ppidOf.get(cur) ?? 0;
+      }
+    }
+  }
+  return matched.filter((pid) => !liveGroup.has(pid));
+}
+
+function reapOrphanWorkers(keepPid: number | null): number {
+  const orphans = listOrphanWorkers(keepPid);
+  for (const pid of orphans) {
+    try { killProcessGroup(pid, "SIGKILL"); } catch {}
+  }
+  return orphans.length;
 }
 
 export function pluginDataDir(): string {
@@ -94,6 +166,33 @@ const NOTIFICATION_POLL_TIMEOUT_MS = 250;
 const POST_TOOL_QUIET_TIMEOUT_MS = 90000;
 const DEFAULT_TURN_CEILING_MS = 300000;
 const AUTH_FAILURE_HINT = "Codex authentication failed — your ChatGPT/Codex login looks expired or invalid. Run `codex login` to refresh, then retry.";
+
+// Raised when the resident worker is wedged (turn/start timed out). runTurn
+// catches it, kills the worker, clears the session, and retries once on a fresh
+// worker via ensureServer. Turns the old 120s hard hang into ~12s + respawn.
+class WorkerStaleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerStaleError";
+  }
+}
+
+// Per-method RPC ceilings. The old code used a flat 120s for every RPC, so a
+// half-dead worker (WS up, turn loop stuck) made turn/start block the full 120s.
+// turn/start / thread/start return in well under a second normally; a timeout
+// there is a reliable wedge signal, so we keep them short and let rpcTurn turn
+// the timeout into a WorkerStaleError for fast kill+restart.
+const RPC_TIMEOUTS_MS: Record<string, number> = {
+  initialize: 5_000,
+  "thread/start": 8_000,
+  "thread/name/set": 5_000,
+  "turn/start": 12_000,
+  "turn/interrupt": 3_000,
+  "mcpServer/tool/call": 30_000,
+  "account/read": 10_000,
+  "config/read": 10_000,
+};
+const DEFAULT_RPC_TIMEOUT_MS = 60_000;
 
 const AUTH_FAILURE_PATTERNS = [
   "invalid_grant",
@@ -238,17 +337,41 @@ async function startWorker(): Promise<SessionState> {
   }
 }
 
+// Best-effort sweep of leaked resident workers from previous crashed sessions.
+// Called from leader_hook onSessionStart so every new zcode session starts
+// clean, instead of accumulating one leaked dual-process worker per crash. The
+// keepPid is read live from session.json: if a worker is still alive and owned
+// by the current session it is spared (whole live group via ppid-chain walk);
+// everything else matching the worker fingerprint is SIGKILLed. Returns the
+// number of orphaned pids reaped. NOTE: concurrent zcode sessions using this
+// plugin on the same host would see each other's live worker as an orphan —
+// see the listOrphanWorkers caveat.
+export function reapOrphanWorkersOnStartup(): number {
+  const s = readSession();
+  return reapOrphanWorkers(s?.pid ?? null);
+}
+
 export async function ensureServer(): Promise<SessionState> {
   const s = readSession();
-  if (s && await isAlive(s)) {
+  // Pre-check the launcher pid BEFORE trusting the WebSocket (see isPidAlive).
+  // Without this, a half-dead worker (pid A gone, pid B still serving WS) passes
+  // isAlive() and gets reused — the next turn/start then hangs until the RPC
+  // ceiling. Checking pid A first fails fast so we spawn a fresh worker.
+  if (s && isPidAlive(s.pid) && await isAlive(s)) {
     if (s.threadId && !residentThreadStale) return s;
     const withThread = await ensureResidentThread(s, process.cwd());
     residentThreadStale = false;
     return withThread;
   }
-
-  unlinkSession();
+  // The session worker is dead or stale: kill it (best effort) and clear state.
+  if (s) {
+    try { killProcessGroup(s.pid, "SIGKILL"); } catch {}
+    unlinkSession();
+  }
   residentChild = undefined;
+  // Reap leaked workers from previous crashed sessions before spawning a new
+  // one, so they stop holding ChatGPT concurrency slots and loopback ports.
+  reapOrphanWorkers(null);
   return startWorker();
 }
 
@@ -298,13 +421,14 @@ export class AppServerClient {
 
   call(method: string, params: any = {}): Promise<JsonRpcMsg> {
     const id = String(++this.idc);
+    const timeoutMs = RPC_TIMEOUTS_MS[method] ?? DEFAULT_RPC_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`rpc timeout: ${method}`));
         }
-      }, 120000);
+      }, timeoutMs);
       (timer as any).unref?.();
 
       this.pending.set(id, (msg) => {
@@ -476,9 +600,6 @@ function isToolShapedItem(item: any): boolean {
   );
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function rpcTurn(
   client: AppServerClient,
@@ -487,7 +608,20 @@ async function rpcTurn(
   cwd: string,
   ephemeralThread: boolean,
 ): Promise<JsonRpcMsg> {
-  let resp = await callRpcAllowError(client, "turn/start", turnParams);
+  let resp: JsonRpcMsg;
+  try {
+    resp = await callRpcAllowError(client, "turn/start", turnParams);
+  } catch (e: any) {
+    // turn/start timed out — the worker is half-dead (WS up, turn loop wedged).
+    // Mark it stale and let runTurn kill+restart+retry instead of waiting the
+    // full turn ceiling. This is the main path that used to hang for 120s.
+    if (/rpc timeout: turn\/start/i.test(e?.message || "")) {
+      residentThreadStale = true;
+      if (!ephemeralThread) clearCachedThread(state);
+      throw new WorkerStaleError(`turn/start timed out — worker wedged: ${e?.message || e}`);
+    }
+    throw e;
+  }
   if (!resp.error) return resp;
 
   const message = formatRpcError("turn/start", resp.error);
@@ -560,34 +694,92 @@ async function runTurnOnState(
     let lastToolCompletionAt = 0;
     let workerDied = false;
     let lastNotificationAt = Date.now();
+    let turnId = "unknown";
 
-    // Detect mid-turn worker death via the WebSocket itself. The old
-    // isWorkerAlive() check reads a module-level residentChild that is undefined
-    // across codex_bridge CLI invocations, so it never fired. The WS close/error
-    // events fire regardless of which process spawned the worker.
-    client.ws.addEventListener("close", () => { workerDied = true; });
-    client.ws.addEventListener("error", () => { workerDied = true; });
+    // Event-driven turn completion (mirrors the official codex-plugin-cc
+    // captureTurn model: resolve a single promise when the turn finishes, instead
+    // of while()+sleep() polling). The turn ends on the first of:
+    //   - turn/completed notification (normal path)
+    //   - worker WS close/error (worker died cleanly, e.g. B exited)
+    //   - postToolQuiet: 90s of silence after the last tool call (send interrupt)
+    //   - parentPidGone: launcher A died mid-turn (half-dead B, WS still open)
+    //   - ceiling: hard turnCeiling timeout (last resort)
+    // The onNotification handler and WS listeners are registered BEFORE rpcTurn
+    // so a worker death during turn/start itself is captured here, not lost.
+    const turnFinished = new Promise<{ reason: string | null }>((resolve) => {
+      let settled = false;
+      const finish = (reason: string | null) => {
+        if (settled) return;
+        settled = true;
+        resolve({ reason });
+      };
 
-    client.onNotification((m) => {
-      const now = Date.now();
-      lastNotificationAt = now;
+      // Worker death via the WebSocket itself (clean exit of the codex binary).
+      client.ws.addEventListener("close", () => { workerDied = true; finish("workerDied"); });
+      client.ws.addEventListener("error", () => { workerDied = true; finish("workerDied"); });
 
-      if (m.method === "item/completed") {
-        const item = m.params?.item || {};
-        rawItems.push(item);
-        if (item.type === "agentMessage" && typeof item.text === "string") {
-          messages.push(item.text);
-        } else if (item.type === "imageGeneration") {
-          imageGeneration.push({
-            status: item.status,
-            result: item.result || "",
-            savedPath: item.savedPath || undefined,
-          });
+      // Notification stream: collect items, mark done on turn/completed, and
+      // arm a postToolQuiet timer that fires if the worker goes silent for 90s
+      // after finishing a tool (a common hang where the turn loop stalls but the
+      // WS stays open). The timer is reset on every tool completion.
+      let postToolTimer: ReturnType<typeof setTimeout> | null = null;
+      const armPostToolQuiet = () => {
+        if (postToolQuietMs <= 0) return;
+        if (postToolTimer) clearTimeout(postToolTimer);
+        postToolTimer = setTimeout(() => {
+          if (settled || done || workerDied) return;
+          sendTurnInterrupt(client, turnId);
+          residentThreadStale = true;
+          finish("postToolQuiet");
+        }, postToolQuietMs);
+        postToolTimer.unref?.();
+      };
+
+      client.onNotification((m) => {
+        const now = Date.now();
+        lastNotificationAt = now;
+        if (m.method === "item/completed") {
+          const item = m.params?.item || {};
+          rawItems.push(item);
+          if (item.type === "agentMessage" && typeof item.text === "string") {
+            messages.push(item.text);
+          } else if (item.type === "imageGeneration") {
+            imageGeneration.push({
+              status: item.status,
+              result: item.result || "",
+              savedPath: item.savedPath || undefined,
+            });
+          }
+          if (isToolShapedItem(item)) {
+            lastToolCompletionAt = now;
+            armPostToolQuiet();
+          }
+        } else if (m.method === "turn/completed") {
+          done = true;
+          finish("turn/completed");
         }
-        if (isToolShapedItem(item)) lastToolCompletionAt = now;
-      } else if (m.method === "turn/completed") {
-        done = true;
-      }
+      });
+
+      // Dual-process guard: codex runs as node-launcher (pid A = session.pid) +
+      // codex-binary (pid B = the WS server). Killing A alone does not close the
+      // WS (B keeps serving), so workerDied never fires. The official plugin
+      // avoids this because it spawns codex as its own child and gets the exit
+      // event directly; this resident model spans CLI invocations and can't, so
+      // we poll pid A liveness on a light unref'd interval. If A is gone the
+      // worker is wedged — finish and let runTurn's WorkerStaleError retry.
+      const livenessTimer = setInterval(() => {
+        if (settled || done || workerDied) return;
+        if (state.pid && !isPidAlive(state.pid)) { finish("parentPidGone"); return; }
+        // isWorkerAlive() reads a module-level residentChild that is undefined
+        // across CLI invocations (always returns true), so it never fires here —
+        // kept only as a defensive in-process check.
+        if (!isWorkerAlive()) finish("isWorkerAlive=false");
+      }, notificationPollMs);
+      livenessTimer.unref?.();
+
+      // Hard ceiling: last-resort timeout so a wedged turn can never run forever.
+      const ceilingTimer = setTimeout(() => finish("ceiling"), turnCeiling);
+      ceilingTimer.unref?.();
     });
 
     const turnParams: any = { threadId, input };
@@ -598,32 +790,10 @@ async function runTurnOnState(
     if (modelOpts.serviceTier) turnParams.serviceTier = modelOpts.serviceTier;
 
     const turnResp = await rpcTurn(client, state, turnParams, cwd, ephemeralThread);
-    const turnId = turnResp.result?.turn?.id || turnResp.result?.turnId || "unknown";
+    turnId = turnResp.result?.turn?.id || turnResp.result?.turnId || "unknown";
     const startedAt = Date.now();
 
-    let breakReason: string | null = null;
-    while (!done && Date.now() - startedAt < turnCeiling) {
-      if (workerDied) { breakReason = "workerDied"; break; }
-      // Dual-process guard: codex runs as node-launcher (pid A, recorded in
-      // session) + codex-binary (pid B, the WS server). Killing A alone does not
-      // close the WS (B keeps serving), so workerDied never fires. Polling pid A
-      // liveness catches the half-death where A is gone but the WS still looks
-      // open — a stale worker that will hang the next turn/start.
-      if (state.pid) {
-        try { process.kill(state.pid, 0); } catch { breakReason = "parentPidGone"; break; }
-      }
-      if (!isWorkerAlive()) { breakReason = "isWorkerAlive=false"; break; }
-
-      const now = Date.now();
-      if (lastToolCompletionAt && now - lastToolCompletionAt > postToolQuietMs) {
-        sendTurnInterrupt(client, turnId);
-        residentThreadStale = true;
-        breakReason = "postToolQuiet";
-        break;
-      }
-
-      await sleep(notificationPollMs);
-    }
+    const { reason: breakReason } = await turnFinished;
 
     if (breakReason && !done) {
       const elapsedMs = Date.now() - startedAt;
@@ -647,8 +817,26 @@ async function runTurnOnState(
 }
 
 export async function runTurn(input: any[], opts: RunTurnOpts = {}): Promise<TurnResult> {
-  const state = await ensureServer();
-  return runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+  let state = await ensureServer();
+  try {
+    return await runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+  } catch (e) {
+    // A wedged resident worker raises WorkerStaleError from rpcTurn (turn/start
+    // timed out). Kill it, clear the session so ensureServer spawns a fresh
+    // worker, and retry the turn exactly once. Turns a hard 120s hang into
+    // ~12s (turn/start ceiling) + worker respawn (~1s) + the retry.
+    if (e instanceof WorkerStaleError) {
+      const stale = readSession();
+      if (stale) {
+        try { killProcessGroup(stale.pid, "SIGKILL"); } catch {}
+        unlinkSession();
+      }
+      residentChild = undefined;
+      state = await ensureServer();
+      return runTurnOnState(state, input, opts, DEFAULT_TURN_CEILING_MS);
+    }
+    throw e;
+  }
 }
 
 export async function runImageTurn(

@@ -24,6 +24,7 @@ Calling `codex` as a CLI per task is slow (tens of seconds of cold start each ti
 
 Measured on a MacBook (gpt-5.5): handshake 17ms, code turn ~11s, vision ~11s, image generation ~21s, producing a real 1254×1254 PNG.
 Resilience (0.5.0): resident thread reuse (no per-dispatch cold start), wedge watchdog (90s post-tool quiet -> interrupt, vs old 5min blind wait), OAuth failure classification.
+Worker lifecycle hardening (0.6.0): closes the dual-process blind spot where a half-dead worker (node launcher pid A dead, codex binary pid B still serving WS) was reused and hung `turn/start` for the full 120s RPC ceiling. Now `ensureServer` pre-checks pid A liveness before trusting the WS, RPC timeouts are per-method (turn/start 12s, default 60s), a `turn/start` timeout raises `WorkerStaleError` which `runTurn` turns into an automatic kill + restart + single retry (turn done turns a hard 120s hang into ~5s self-heal). Orphaned workers from crashed sessions are reaped on `SessionStart` and on every reconnect via a ppid-chain fingerprint match. Turn completion switched from `while()+sleep()` polling to event-driven (`turn/completed` / WS close / post-tool-quiet / parent-pid-gone / ceiling, first wins), mirroring the official codex-plugin-cc `captureTurn` model.
 
 ## Model tier routing (0.5.0)
 

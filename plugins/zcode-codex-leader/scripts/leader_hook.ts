@@ -10,7 +10,7 @@
 
 import { readFileSync } from "node:fs";
 import { constitution } from "./constitution.ts";
-import { readSession, stopServer } from "./app_server_pool.ts";
+import { readSession, stopServer, reapOrphanWorkersOnStartup } from "./app_server_pool.ts";
 
 // Read the full stdin as a JSON object. Hooks receive a single JSON payload.
 function readStdinJson(): any {
@@ -49,6 +49,11 @@ function onSessionStart(): void {
   // (Starting it here previously caused hook timeouts: the worker spawn +
   // WebSocket probe kept the event loop alive past the hook's timeout.)
   emitContext(constitution(pluginRoot));
+  // Best-effort: reap any resident workers leaked by a previous crashed zcode
+  // session. Cheap (one `ps` + a SIGKILL per orphan, ~5ms), synchronous, and
+  // keeps a crash from accumulating one leaked dual-process worker per run —
+  // each holds a loopback port and a ChatGPT concurrency slot.
+  try { reapOrphanWorkersOnStartup(); } catch {}
   process.exit(0);
 }
 
