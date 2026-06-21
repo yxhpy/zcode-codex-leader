@@ -18,6 +18,8 @@ type GptProTask = {
   prompt: string;
   baselineCount: number;
   sentAt: number;
+  pid?: number;
+  heartbeatAt?: number;
   status: "generating" | "timed-out" | "completed";
   partialText?: string;
 };
@@ -73,6 +75,11 @@ function readTask(): GptProTask | null {
 
 function writeTask(t: GptProTask): void {
   writeFileSync(taskPath(), JSON.stringify(t, null, 2));
+}
+
+function isPidAlive(pid?: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 function clearTask(): void {
@@ -698,7 +705,12 @@ function askCommand(args: string[]): number {
 
   const existing = readTask();
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-  if (existing && existing.status !== "completed" && Date.now() - existing.sentAt < TWO_HOURS_MS && !parsed.force) {
+  // ponytail: stale-lock cleanup — if the recorded pid died, the task crashed; clear and proceed rather than dead-waiting 2h.
+  if (existing && existing.status !== "completed" && !isPidAlive(existing.pid)) {
+    const ageMin = Math.round((Date.now() - existing.sentAt) / 60000);
+    log(`stale gpt-pro task found (status=${existing.status}, started ${ageMin}m ago, pid ${existing.pid ?? "unknown"} no longer alive). Clearing lock.`);
+    clearTask();
+  } else if (existing && existing.status !== "completed" && Date.now() - existing.sentAt < TWO_HOURS_MS && !parsed.force) {
     const ageMin = Math.round((Date.now() - existing.sentAt) / 60000);
     log(`unfinished gpt-pro task found (status=${existing.status}, started ${ageMin}m ago, url=${existing.conversationUrl}).`);
     log(`Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
@@ -788,6 +800,8 @@ function askCommand(args: string[]): number {
         prompt: parsed.prompt,
         baselineCount,
         sentAt: Date.now(),
+        heartbeatAt: Date.now(),
+        pid: process.pid,
         status: "generating",
       });
     } else {

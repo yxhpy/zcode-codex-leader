@@ -457,7 +457,10 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const timeoutForHardLimit = flags.timeout && /^\d+$/.test(flags.timeout) ? `${flags.timeout}s` : flags.timeout;
-  const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLimit) : 900000) + 60000;
+  // ponytail: outer budget must cover inner gpt_pro.ts auto-extend ceiling (MAX_AUTO_EXTEND_MS=1800000) + a 60s buffer,
+  // otherwise the wrapper SIGTERMs the child mid-extend and long Pro tasks die as "unstable".
+  const GPT_PRO_AUTO_EXTEND_CEILING_MS = 30 * 60 * 1000;
+  const hardTimeoutMs = (timeoutForHardLimit ? parseAgyTimeoutMs(timeoutForHardLimit) : 900000) + GPT_PRO_AUTO_EXTEND_CEILING_MS + 60000;
   const code = await new Promise<number | null>((resolve) => {
     const timer = setTimeout(() => {
       timedOut = true;
