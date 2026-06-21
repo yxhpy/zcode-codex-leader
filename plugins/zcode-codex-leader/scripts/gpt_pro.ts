@@ -42,6 +42,13 @@ type WaitOutcome = {
 
 const FALLBACK_OPENCLI = "/opt/homebrew/bin/opencli";
 const MAX_FILE_BYTES = 200 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+function isImagePath(filePath: string): boolean {
+  return IMAGE_EXTENSIONS.has(extname(filePath).toLowerCase());
+}
+
 const CHATGPT_URL = "https://chatgpt.com";
 const MAX_AUTO_EXTEND_MS = 1800000; // hard ceiling for dynamic deadline extension (30 min beyond initial timeout)
 const ASSISTANT_COUNT_JS = "(()=>document.querySelectorAll('[data-message-author-role=assistant]').length)()";
@@ -605,6 +612,15 @@ function mimeTypeForPath(filePath: string): string {
       return "application/json";
     case ".md":
       return "text/markdown";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
     default:
       return "text/plain";
   }
@@ -630,6 +646,32 @@ async function uploadFiles(filePaths: string[], deadline: number): Promise<void>
   for (const filePath of filePaths) {
     requireBeforeDeadline(deadline, `upload ${basename(filePath)}`);
     const stat = statSync(filePath);
+    const name = basename(filePath);
+    const mimeType = mimeTypeForPath(filePath);
+    const image = isImagePath(filePath);
+    if (image) {
+      // ponytail: images are binary — read as Buffer, base64-encode, reconstruct as Uint8Array in the browser. Bypasses the text-only NUL check and uses a larger 10MB limit.
+      if (stat.size > MAX_IMAGE_BYTES) {
+        throw new Error(`image too large for --file (max 10MB): ${filePath} (${stat.size} bytes)`);
+      }
+      const b64 = readFileSync(filePath).toString("base64");
+      const js = `(()=>{const i=document.querySelector('#upload-files');if(!i)return JSON.stringify({ok:false,error:'missing #upload-files'});const dt=new DataTransfer();for(const file of Array.from(i.files||[])){dt.items.add(file);}const b64=${JSON.stringify(b64)};const bin=atob(b64);const bytes=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++){bytes[k]=bin.charCodeAt(k);}dt.items.add(new File([bytes],${JSON.stringify(name)},{type:${JSON.stringify(mimeType)}}));i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({ok:true,name:${JSON.stringify(name)},size:${stat.size}});})()`;
+      const uploaded = await runOpencliWithinDeadline(["browser", "eval", js], deadline);
+      requireSuccess(uploaded, `opencli browser eval upload image ${name}`);
+      let payload: { ok?: boolean; error?: string };
+      try {
+        payload = JSON.parse(uploaded.stdout.trim());
+      } catch {
+        throw new Error(`upload image ${name} returned invalid JSON\n${uploaded.stdout.trim() || uploaded.stderr.trim()}`);
+      }
+      if (!payload.ok) {
+        throw new Error(`upload image ${name} failed${payload.error ? `: ${payload.error}` : ""}`);
+      }
+      requireBeforeDeadline(deadline, `wait after upload ${name}`);
+      requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after upload");
+      continue;
+    }
+    // text path (original logic)
     if (stat.size > MAX_FILE_BYTES) {
       throw new Error(`file too large for --file (max 200KB): ${filePath} (${stat.size} bytes)`);
     }
@@ -638,8 +680,6 @@ async function uploadFiles(filePaths: string[], deadline: number): Promise<void>
       throw new Error(`binary file not supported by --file (text only): ${filePath}`);
     }
     const content = readFileSync(filePath, "utf8");
-    const name = basename(filePath);
-    const mimeType = mimeTypeForPath(filePath);
     const js = `(()=>{const i=document.querySelector('#upload-files');if(!i)return JSON.stringify({ok:false,error:'missing #upload-files'});const dt=new DataTransfer();for(const file of Array.from(i.files||[])){dt.items.add(file);}dt.items.add(new File([${JSON.stringify(content)}],${JSON.stringify(name)},{type:${JSON.stringify(mimeType)}}));i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({ok:true,name:${JSON.stringify(name)},size:${Buffer.byteLength(content, "utf8")}});})()`;
     const uploaded = await runOpencliWithinDeadline(["browser", "eval", js], deadline);
     requireSuccess(uploaded, `opencli browser eval upload ${name}`);
