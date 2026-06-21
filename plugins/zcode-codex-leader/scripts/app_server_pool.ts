@@ -266,6 +266,18 @@ async function isAlive(s: SessionState): Promise<boolean> {
 function workerArgs(imageGeneration: boolean): string[] {
   return [
     "app-server", "--listen", "ws://127.0.0.1:0",
+    // approval_policy=never: dangerous ops (rm, mv, network) would otherwise block
+    // waiting for a human reviewer that never comes in app-server mode (no TTY),
+    // hanging turn/start until the RPC ceiling. This MUST be passed via -c:
+    // codex has a known bug (#27617) where approval_policy in config.toml is
+    // ignored by the CLI, so the user's global setting can't save us. Paired
+    // with sandbox_mode below so the worker can write but can't escape the
+    // workspace without us knowing.
+    "-c", "approval_policy=never",
+    // sandbox_mode=workspace-write: let the worker edit files and run commands
+    // inside the project cwd without prompting. Matches the test worker's
+    // default and the leader-only contract (all writes go through this worker).
+    "-c", "sandbox_mode=\"workspace-write\"",
     "-c", "features.plugins=false",
     "-c", "mcp_servers={}",
     "-c", "mcp_servers.node_repl.enabled=false",
@@ -866,7 +878,10 @@ export async function runTestTurn(
     const sandboxMode = browser || fullAccess ? "danger-full-access" : "workspace-write";
     const args = [
       ...workerArgs(false),
-      "-c", `sandbox_mode="${sandboxMode}"`,
+      // Override the default workspace-write from workerArgs when browser or
+      // full access is requested. codex applies repeated -c keys last-wins, so
+      // this correctly overrides the base sandbox_mode for the test worker.
+      ...(browser || fullAccess ? ["-c", `sandbox_mode=\"${sandboxMode}\"`] : []),
     ];
 
     if (browser) {
