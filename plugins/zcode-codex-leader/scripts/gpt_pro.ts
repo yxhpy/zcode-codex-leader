@@ -86,6 +86,28 @@ function clearTask(): void {
   try { unlinkSync(taskPath()); } catch {}
 }
 
+// ponytail: incremental-flush state for SIGTERM recovery. waitForAssistantReply updates this on every grow-flush so a SIGTERM handler can do one final save before exit.
+let pendingPartial: { text: string; out?: string } | null = null;
+
+// ponytail: incremental flush — write the current cumulative assistant text to the --out file (overwrite) and to the task file's partialText field. Called on every content GROWTH inside the polling loop so a kill mid-generation still leaves recoverable content on disk. Does NOT touch stdout (stdout emits a pointer only, see writeAssistantOutput).
+function flushPartial(text: string, out?: string): void {
+  if (!text) return;
+  pendingPartial = { text, out };
+  if (out) {
+    const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
+    try {
+      writeFileSync(absoluteOut, text, "utf8");
+    } catch (e) {
+      process.stderr.write(`gpt-pro: incremental flush to ${absoluteOut} failed: ${(e as Error).message}\n`);
+    }
+  }
+  const task = readTask();
+  if (task && task.status !== "completed") {
+    task.partialText = text;
+    writeTask(task);
+  }
+}
+
 function usage(): string {
   return [
     "Usage:",
@@ -408,13 +430,15 @@ function readAssistantSnapshot(deadline?: number): { count: number; text: string
 }
 
 function writeAssistantOutput(text: string, out?: string): void {
-  // Always print the full response to stdout so the leader receives the content
-  // directly via codex_bridge.ts. The --out option only persists an extra copy.
-  process.stdout.write(`${text}\n`);
   if (out) {
+    // ponytail: long-output stability — when --out is set, the full text lives in the file (durable, survives process kill). stdout emits ONLY a pointer so codex_bridge.ts never has to pipe megabytes of text through Bash's 600s ceiling. The leader reads the result from the file.
     const absoluteOut = isAbsolute(out) ? out : resolve(process.cwd(), out);
     writeFileSync(absoluteOut, text, "utf8");
-    process.stderr.write(`gpt-pro: result copy saved to ${absoluteOut}\n`);
+    process.stdout.write(`RESULT_FILE:${absoluteOut}\n`);
+    process.stderr.write(`gpt-pro: result saved to ${absoluteOut}\n`);
+  } else {
+    // backward-compat: no --out → full text to stdout (still subject to transport limits; long tasks should use --out)
+    process.stdout.write(`${text}\n`);
   }
 }
 
@@ -435,12 +459,18 @@ function waitForAssistantReply(params: {
   let currentCount = params.baselineCount;
   let stableReads = 0;
 
+  let lastFlushedText = "";
   const updateSnapshot = (snapshot: { count: number; text: string }): void => {
     currentCount = snapshot.count;
     currentText =
       snapshot.count > params.baselineCount || (resumeMode && snapshot.count >= params.baselineCount)
         ? snapshot.text
         : "";
+    // ponytail: flush incrementally on content growth — page jitter can momentarily shorten currentText, so only write when it genuinely grew past the last flush. This is what makes a SIGTERM/timeout kill recoverable: the most recent grown snapshot is already on disk.
+    if (currentText && currentText !== lastFlushedText && currentText.length > lastFlushedText.length) {
+      flushPartial(currentText, params.out);
+      lastFlushedText = currentText;
+    }
   };
   const acceptable = (text: string): boolean => {
     if (!text) {
@@ -998,5 +1028,18 @@ function main(): number {
   log(usage());
   return 2;
 }
+
+// ponytail: on SIGTERM (outer timeout / Bash 600s ceiling) do one final flush of whatever we last saw, then exit 0 so codex_bridge.ts treats it as success and forwards the RESULT_FILE pointer. SIGKILL/-9 and OOM can't be caught — for those, the incremental flush inside updateSnapshot is the safety net (worst case: lose ~2s of generation between snapshots, recoverable via `gpt-pro continue`).
+function installSignalFlush(): void {
+  const handler = (sig: NodeJS.Signals) => {
+    if (pendingPartial?.text) {
+      flushPartial(pendingPartial.text, pendingPartial.out);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+}
+installSignalFlush();
 
 process.exitCode = main();
