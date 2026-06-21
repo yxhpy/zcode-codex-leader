@@ -1,6 +1,6 @@
 {
   "name": "zcode-codex-leader",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "description": "Force ZCode into leader-only mode. Hard PreToolUse gate blocks direct edits and commands; all code generation, visual understanding, image generation, and MCP tool work is dispatched to a resident codex app-server worker via codex_bridge.ts. SessionStart injects the leader constitution and starts the worker; Stop enforces Plugin evidence.",
   "author": {
     "name": "zcode-codex-leader contributors"

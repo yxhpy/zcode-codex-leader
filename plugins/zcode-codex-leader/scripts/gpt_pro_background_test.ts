@@ -5,13 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-const scriptPath = path.join(repoRoot, "plugins/zcode-codex-leader/scripts/gpt_pro.ts");
+const scriptDir = path.dirname(new URL(import.meta.url).pathname);
+const scriptPath = path.join(scriptDir, "gpt_pro.ts");
 const nodeArgs = ["--experimental-strip-types", scriptPath];
 
 function run(pluginData: string, args: string[], extraEnv: Record<string, string> = {}): { code: number | null; stdout: string; stderr: string } {
   const result = spawnSync(process.execPath, [...nodeArgs, ...args], {
-    cwd: repoRoot,
+    cwd: process.cwd(),
     env: { ...process.env, PLUGIN_DATA: pluginData, ...extraEnv },
     encoding: "utf8",
   });
@@ -21,7 +21,7 @@ function run(pluginData: string, args: string[], extraEnv: Record<string, string
 function runAsync(pluginData: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, ...args], {
-      cwd: repoRoot,
+      cwd: process.cwd(),
       env: { ...process.env, PLUGIN_DATA: pluginData, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
