@@ -375,6 +375,14 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
     env: process.env,
     cwd: process.cwd(),
   });
+  // ponytail: forward parent SIGTERM/SIGINT to the agy child so the Bash 600s ceiling doesn't orphan it. Without this, codex_bridge dies but agy keeps running, holding the opencli browser bridge indefinitely.
+  const forwardAgySignal = () => {
+    try { child.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000);
+    process.exit(143);
+  };
+  process.on("SIGTERM", forwardAgySignal);
+  process.on("SIGINT", forwardAgySignal);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -392,6 +400,8 @@ async function cmdAgy(positional: string[], flags: Record<string, string>): Prom
     child.on("close", (closeCode) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      process.off("SIGTERM", forwardAgySignal);
+      process.off("SIGINT", forwardAgySignal);
       resolve(closeCode);
     });
     child.on("error", (e) => fail(`failed to start agy: ${e.message}`));
@@ -449,6 +459,14 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     env: process.env,
     cwd: process.cwd(),
   });
+  // ponytail: forward parent SIGTERM/SIGINT to the gpt_pro child so the Bash 600s ceiling doesn't orphan it. Without this, codex_bridge dies but gpt_pro keeps running, holding the opencli browser bridge indefinitely.
+  const forwardSignal = () => {
+    try { child.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000);
+    process.exit(143);
+  };
+  process.on("SIGTERM", forwardSignal);
+  process.on("SIGINT", forwardSignal);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -470,6 +488,8 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     child.on("close", (closeCode) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      process.off("SIGTERM", forwardSignal);
+      process.off("SIGINT", forwardSignal);
       resolve(closeCode);
     });
     child.on("error", (e) => fail(`failed to start gpt-pro: ${e.message}`));

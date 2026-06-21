@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --experimental-strip-types
 
-import { spawnSync } from "child_process";
+import { spawn } from "child_process";
 import { existsSync, accessSync, constants, readFileSync, statSync, writeFileSync, unlinkSync } from "node:fs";
 import path, { basename, extname, isAbsolute, resolve } from "node:path";
 import { pluginDataDir } from "./app_server_pool.ts";
@@ -159,20 +159,47 @@ function resolveOpencliBin(): string {
 
 const opencliBin = resolveOpencliBin();
 
-function runCommand(bin: string, args: string[], timeoutMs = 60000): RunResult {
-  const result = spawnSync(bin, args, {
-    encoding: "utf8",
-    shell: false,
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: timeoutMs,
+function runCommand(bin: string, args: string[], timeoutMs = 60000): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, {
+      encoding: "utf8",
+      shell: false,
+      env: process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGTERM"); } catch {}
+    }, timeoutMs);
+    const finish = (status: number | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: stdout || "",
+        stderr: stderr || "",
+        status: timedOut ? null : status,
+        error: error || (timedOut ? new Error(`command timed out after ${timeoutMs}ms`) : undefined),
+      });
+    };
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (stdout.length > 10 * 1024 * 1024) {
+        stdout = stdout.slice(-5 * 1024 * 1024);
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.length > 10 * 1024 * 1024) {
+        stderr = stderr.slice(-5 * 1024 * 1024);
+      }
+    });
+    child.on("close", (code: number | null) => finish(code));
+    child.on("error", (e: Error) => finish(null, e));
   });
-
-  return {
-    stdout: result.stdout || "",
-    stderr: result.stderr || "",
-    status: result.status,
-    error: result.error,
-  };
 }
 
 function opencliTimeoutMs(args: string[]): number {
@@ -195,14 +222,14 @@ function opencliTimeoutMs(args: string[]): number {
   return 60000;
 }
 
-function runOpencli(args: string[], timeoutMs = opencliTimeoutMs(args)): RunResult {
-  return runCommand(opencliBin, args, timeoutMs);
+async function runOpencli(args: string[], timeoutMs = opencliTimeoutMs(args)): Promise<RunResult> {
+  return await runCommand(opencliBin, args, timeoutMs);
 }
 
-function runOpencliWithinDeadline(args: string[], deadline: number): RunResult {
+async function runOpencliWithinDeadline(args: string[], deadline: number): Promise<RunResult> {
   requireBeforeDeadline(deadline, `opencli ${args.join(" ")}`);
   const remainingMs = Math.max(1, deadline - Date.now());
-  return runOpencli(args, Math.min(opencliTimeoutMs(args), remainingMs));
+  return await runOpencli(args, Math.min(opencliTimeoutMs(args), remainingMs));
 }
 
 function outputOf(result: RunResult): string {
@@ -224,9 +251,9 @@ function isBridgeConnected(result: RunResult): boolean {
   return /\bBridge\b[\s\S]*\bconnected\b/i.test(text) || /\bconnected\b/i.test(text);
 }
 
-function stateText(deadline?: number): RunResult {
+async function stateText(deadline?: number): Promise<RunResult> {
   const args = ["browser", "state"];
-  return deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+  return deadline === undefined ? await runOpencli(args) : await runOpencliWithinDeadline(args, deadline);
 }
 
 function findComposerIndex(state: string): string | null {
@@ -262,24 +289,24 @@ function parseStatusState(state: string): { loggedIn: boolean; plan: "pro" | fal
   };
 }
 
-function statusCommand(): number {
-  const doctor = runOpencli(["doctor"]);
+async function statusCommand(): Promise<number> {
+  const doctor = await runOpencli(["doctor"]);
   const bridge = isBridgeConnected(doctor);
   let loggedIn = false;
   let plan: "pro" | false = false;
 
   try {
-    const opened = runOpencli(["browser", "open", CHATGPT_URL]);
+    const opened = await runOpencli(["browser", "open", CHATGPT_URL]);
     if (commandFailed(opened)) {
       throw new Error(opened.error?.message || opened.stderr || "opencli browser open failed");
     }
 
-    const waited = runOpencli(["browser", "wait", "time", "5"]);
+    const waited = await runOpencli(["browser", "wait", "time", "5"]);
     if (commandFailed(waited)) {
       throw new Error(waited.error?.message || waited.stderr || "opencli browser wait failed");
     }
 
-    const state = stateText();
+    const state = await stateText();
     if (commandFailed(state)) {
       throw new Error(state.error?.message || state.stderr || "opencli browser state failed");
     }
@@ -410,9 +437,9 @@ function requireBeforeDeadline(deadline: number, label = "operation"): void {
   }
 }
 
-function readAssistantSnapshot(deadline?: number): { count: number; text: string } | null {
+async function readAssistantSnapshot(deadline?: number): Promise<{ count: number; text: string } | null> {
   const args = ["browser", "eval", EXTRACT_NEW_ASSISTANT_JS];
-  const evaluated = deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+  const evaluated = deadline === undefined ? await runOpencli(args) : await runOpencliWithinDeadline(args, deadline);
   if (commandFailed(evaluated)) {
     log(`opencli browser eval failed: ${evaluated.error?.message || evaluated.stderr || evaluated.status}`);
     return null;
@@ -442,14 +469,14 @@ function writeAssistantOutput(text: string, out?: string): void {
   }
 }
 
-function waitForAssistantReply(params: {
+async function waitForAssistantReply(params: {
   deadline: number;
   absoluteCeiling: number;
   baselineCount: number;
   sentAt: number;
   prevPartial?: string;
   out?: string;
-}): WaitOutcome {
+}): Promise<WaitOutcome> {
   let deadline = params.deadline;
   const resumeMode = Object.prototype.hasOwnProperty.call(params, "prevPartial");
   const generationStartDeadline = Math.min(deadline, params.sentAt + 30000);
@@ -481,7 +508,7 @@ function waitForAssistantReply(params: {
   const currentDeadline = (): number => (Date.now() < deadline ? deadline : params.absoluteCeiling);
 
   while (Date.now() < generationStartDeadline) {
-    const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
+    const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
       sawGenerating = true;
       break;
@@ -490,13 +517,13 @@ function waitForAssistantReply(params: {
       log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
     }
 
-    const snapshot = readAssistantSnapshot(deadline);
+    const snapshot = await readAssistantSnapshot(deadline);
     if (snapshot) {
       updateSnapshot(snapshot);
     }
 
     if (Date.now() < generationStartDeadline) {
-      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
       if (commandFailed(waited)) {
         log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
       }
@@ -505,14 +532,14 @@ function waitForAssistantReply(params: {
 
   while (Date.now() < params.absoluteCeiling) {
     const operationDeadline = currentDeadline();
-    const generating = runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], operationDeadline);
+    const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], operationDeadline);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
       sawGenerating = true;
       if (Date.now() >= deadline && Date.now() < params.absoluteCeiling) {
         deadline = Math.min(params.absoluteCeiling, deadline + 120000);
         log(`extending deadline (still generating): +120s, new total budget ${Math.round((deadline - params.sentAt) / 1000)}s`);
       }
-      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
       if (commandFailed(waited)) {
         log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
       }
@@ -522,7 +549,7 @@ function waitForAssistantReply(params: {
       log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
     }
 
-    const snapshot = readAssistantSnapshot(operationDeadline);
+    const snapshot = await readAssistantSnapshot(operationDeadline);
     if (snapshot) {
       updateSnapshot(snapshot);
     }
@@ -542,14 +569,14 @@ function waitForAssistantReply(params: {
     }
 
     if (Date.now() < deadline) {
-      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
+      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
       if (commandFailed(waited)) {
         log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
       }
     } else if (Date.now() < params.absoluteCeiling) {
       // Past the initial deadline but within the auto-extend window: avoid a
       // tight spin while waiting for the next generating/stable check.
-      const waited = runOpencliWithinDeadline(["browser", "wait", "time", "2"], params.absoluteCeiling);
+      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], params.absoluteCeiling);
       if (commandFailed(waited)) {
         log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
       }
@@ -583,13 +610,13 @@ function mimeTypeForPath(filePath: string): string {
   }
 }
 
-function uploadFiles(filePaths: string[], deadline: number): void {
+async function uploadFiles(filePaths: string[], deadline: number): Promise<void> {
   requireBeforeDeadline(deadline, "clear uploads");
   const clearJs = `(()=>{const i=document.querySelector('#upload-files');if(i){const dt=new DataTransfer();i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));}return JSON.stringify({ok:true,remaining:i&&i.files?i.files.length:0});})()`;
-  const cleared = runOpencliWithinDeadline(["browser", "eval", clearJs], deadline);
+  const cleared = await runOpencliWithinDeadline(["browser", "eval", clearJs], deadline);
   requireSuccess(cleared, "opencli browser eval clear uploads");
   requireBeforeDeadline(deadline, "wait after clear uploads");
-  requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after clear uploads");
+  requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after clear uploads");
   let clearPayload: { remaining?: number };
   try {
     clearPayload = JSON.parse(cleared.stdout.trim());
@@ -614,7 +641,7 @@ function uploadFiles(filePaths: string[], deadline: number): void {
     const name = basename(filePath);
     const mimeType = mimeTypeForPath(filePath);
     const js = `(()=>{const i=document.querySelector('#upload-files');if(!i)return JSON.stringify({ok:false,error:'missing #upload-files'});const dt=new DataTransfer();for(const file of Array.from(i.files||[])){dt.items.add(file);}dt.items.add(new File([${JSON.stringify(content)}],${JSON.stringify(name)},{type:${JSON.stringify(mimeType)}}));i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({ok:true,name:${JSON.stringify(name)},size:${Buffer.byteLength(content, "utf8")}});})()`;
-    const uploaded = runOpencliWithinDeadline(["browser", "eval", js], deadline);
+    const uploaded = await runOpencliWithinDeadline(["browser", "eval", js], deadline);
     requireSuccess(uploaded, `opencli browser eval upload ${name}`);
     let payload: { ok?: boolean; error?: string };
     try {
@@ -626,13 +653,13 @@ function uploadFiles(filePaths: string[], deadline: number): void {
       throw new Error(`upload ${name} failed${payload.error ? `: ${payload.error}` : ""}`);
     }
     requireBeforeDeadline(deadline, `wait after upload ${name}`);
-    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after upload");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait after upload");
   }
 
   requireBeforeDeadline(deadline, "upload verification");
   const expectedNames = filePaths.map((filePath) => basename(filePath));
   const verifyJs = `(()=>{const input=document.querySelector('#upload-files');const filesLength=input&&input.files?input.files.length:0;const bodyText=document.body?document.body.innerText:'';const elements=[...document.querySelectorAll('[aria-label]')].map((el)=>el.getAttribute('aria-label')||'');const hasRemove=elements.some((label)=>label.includes('移除')||label.includes('Remove')||label.includes('remove'));const names=${JSON.stringify(expectedNames)};const missingNames=names.filter((name)=>!bodyText.includes(name)&&!elements.some((label)=>label.includes(name)));return JSON.stringify({filesLength,expected:${filePaths.length},hasRemove,missingNames});})()`;
-  const verified = runOpencliWithinDeadline(["browser", "eval", verifyJs], deadline);
+  const verified = await runOpencliWithinDeadline(["browser", "eval", verifyJs], deadline);
   requireSuccess(verified, "opencli browser eval upload verification");
   let payload: { filesLength?: number; expected?: number; hasRemove?: boolean; missingNames?: string[] };
   try {
@@ -648,14 +675,14 @@ function uploadFiles(filePaths: string[], deadline: number): void {
   }
 }
 
-function sendPrompt(deadline: number): void {
+async function sendPrompt(deadline: number): Promise<void> {
   requireBeforeDeadline(deadline, "send prompt");
-  requireSuccess(runOpencliWithinDeadline(["browser", "keys", "Enter"], deadline), "opencli browser keys Enter");
+  requireSuccess(await runOpencliWithinDeadline(["browser", "keys", "Enter"], deadline), "opencli browser keys Enter");
   requireBeforeDeadline(deadline, "wait after Enter");
-  requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after Enter");
+  requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after Enter");
 
   requireBeforeDeadline(deadline, "prompt sent check");
-  const sentCheck = runOpencliWithinDeadline(["browser", "eval", PROMPT_SENT_JS], deadline);
+  const sentCheck = await runOpencliWithinDeadline(["browser", "eval", PROMPT_SENT_JS], deadline);
   requireSuccess(sentCheck, "opencli browser eval prompt sent check");
   let sentPayload: { sent?: boolean; composerLength?: number };
   try {
@@ -670,7 +697,7 @@ function sendPrompt(deadline: number): void {
   let lastError = "";
   for (let attempt = 0; attempt < 8; attempt += 1) {
     requireBeforeDeadline(deadline, "click send");
-    const submitted = runOpencliWithinDeadline(["browser", "eval", SUBMIT_PROMPT_JS], deadline);
+    const submitted = await runOpencliWithinDeadline(["browser", "eval", SUBMIT_PROMPT_JS], deadline);
     requireSuccess(submitted, "opencli browser eval click send");
     let submitPayload: { ok?: boolean; error?: string };
     try {
@@ -683,14 +710,14 @@ function sendPrompt(deadline: number): void {
     }
     lastError = submitPayload.error || "unknown error";
     requireBeforeDeadline(deadline, "wait for send button");
-    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait for send button");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait for send button");
   }
   throw new Error(`click send failed${lastError ? `: ${lastError}` : ""}`);
 }
 
-function clearComposer(deadline?: number): void {
+async function clearComposer(deadline?: number): Promise<void> {
   const args = ["browser", "eval", CLEAR_COMPOSER_JS];
-  const cleared = deadline === undefined ? runOpencli(args) : runOpencliWithinDeadline(args, deadline);
+  const cleared = deadline === undefined ? await runOpencli(args) : await runOpencliWithinDeadline(args, deadline);
   requireSuccess(cleared, "opencli browser eval clear composer");
   let payload: { ok?: boolean; error?: string };
   try {
@@ -703,8 +730,8 @@ function clearComposer(deadline?: number): void {
   }
 }
 
-function getComposerIndex(deadline?: number): string | null {
-  const first = stateText(deadline);
+async function getComposerIndex(deadline?: number): Promise<string | null> {
+  const first = await stateText(deadline);
   if (!commandFailed(first)) {
     const found = findComposerIndex(outputOf(first));
     if (found) {
@@ -714,7 +741,7 @@ function getComposerIndex(deadline?: number): string | null {
     log(`opencli browser state failed: ${first.error?.message || first.stderr || first.status}`);
   }
 
-  const second = stateText(deadline);
+  const second = await stateText(deadline);
   if (commandFailed(second)) {
     log(`opencli browser state retry failed: ${second.error?.message || second.stderr || second.status}`);
     return null;
@@ -723,7 +750,7 @@ function getComposerIndex(deadline?: number): string | null {
   return findComposerIndex(outputOf(second));
 }
 
-function askCommand(args: string[]): number {
+async function askCommand(args: string[]): Promise<number> {
   let parsed: AskArgs;
   try {
     parsed = parseAskArgs(args);
@@ -756,7 +783,7 @@ function askCommand(args: string[]): number {
   let deadline = Date.now() + parsed.timeoutSec * 1000;
   const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
   try {
-    const doctor = runOpencliWithinDeadline(["doctor"], deadline);
+    const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
     if (!isBridgeConnected(doctor)) {
       log("opencli Bridge is not connected.");
       if (doctor.error) {
@@ -768,34 +795,34 @@ function askCommand(args: string[]): number {
       return 2;
     }
 
-    requireSuccess(runOpencliWithinDeadline(["browser", "open", CHATGPT_URL], deadline), "opencli browser open");
-    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "open", CHATGPT_URL], deadline), "opencli browser open");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
 
-    const composerIndex = getComposerIndex(deadline);
+    const composerIndex = await getComposerIndex(deadline);
     if (!composerIndex) {
       throw new Error("could not find ChatGPT composer element id=prompt-textarea role=textbox");
     }
 
-    clearComposer(deadline);
-    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after clear composer");
+    await clearComposer(deadline);
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after clear composer");
 
     if (parsed.files.length > 0) {
-      uploadFiles(parsed.files, deadline);
+      await uploadFiles(parsed.files, deadline);
     }
 
     const prompt = parsed.prompt || (parsed.files.length > 0 ? "请审查上传的文件。" : "");
     if (prompt) {
-      requireSuccess(runOpencliWithinDeadline(["browser", "type", composerIndex, prompt], deadline), "opencli browser type");
+      requireSuccess(await runOpencliWithinDeadline(["browser", "type", composerIndex, prompt], deadline), "opencli browser type");
     }
 
-    const baselineCountResult = runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    const baselineCountResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
     requireSuccess(baselineCountResult, "opencli browser eval assistant baseline count");
     const baselineCount = Number(baselineCountResult.stdout.trim());
     if (!Number.isFinite(baselineCount)) {
       throw new Error(`assistant baseline count returned invalid value\n${baselineCountResult.stdout.trim() || baselineCountResult.stderr.trim()}`);
     }
 
-    sendPrompt(deadline);
+    await sendPrompt(deadline);
 
     // Persist the conversation URL as soon as ChatGPT assigns one, so a later
     // `gpt-pro continue` can reopen this exact conversation if we time out or get
@@ -804,7 +831,7 @@ function askCommand(args: string[]): number {
     let conversationId = "";
     for (let attempt = 0; attempt < 8; attempt += 1) {
       requireBeforeDeadline(deadline, "extract conversation url");
-      const urlResult = runOpencliWithinDeadline(["browser", "eval", EXTRACT_CONVERSATION_URL_JS], deadline);
+      const urlResult = await runOpencliWithinDeadline(["browser", "eval", EXTRACT_CONVERSATION_URL_JS], deadline);
       if (!commandFailed(urlResult)) {
         try {
           const payload = JSON.parse(urlResult.stdout.trim()) as { url?: string; pathname?: string };
@@ -820,7 +847,7 @@ function askCommand(args: string[]): number {
       }
       if (attempt < 7) {
         requireBeforeDeadline(deadline, "wait for conversation url");
-        requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait for conversation url");
+        requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait for conversation url");
       }
     }
     if (conversationUrl) {
@@ -839,7 +866,7 @@ function askCommand(args: string[]): number {
     }
 
     const sentAt = Date.now();
-    const outcome = waitForAssistantReply({
+    const outcome = await waitForAssistantReply({
       deadline,
       absoluteCeiling,
       baselineCount,
@@ -877,7 +904,7 @@ function askCommand(args: string[]): number {
   }
 }
 
-function continueCommand(args: string[]): number {
+async function continueCommand(args: string[]): Promise<number> {
   let url: string | undefined;
   let timeoutSec = 900;
   let out: string | undefined;
@@ -934,7 +961,7 @@ function continueCommand(args: string[]): number {
   let deadline = Date.now() + timeoutSec * 1000;
   const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
   try {
-    const doctor = runOpencliWithinDeadline(["doctor"], deadline);
+    const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
     if (!isBridgeConnected(doctor)) {
       log("opencli Bridge is not connected.");
       if (doctor.error) log(doctor.error.message);
@@ -942,14 +969,14 @@ function continueCommand(args: string[]): number {
       return 2;
     }
 
-    requireSuccess(runOpencliWithinDeadline(["browser", "open", conversationUrl], deadline), "opencli browser open conversation");
-    requireSuccess(runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "open", conversationUrl], deadline), "opencli browser open conversation");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
 
     // After reload, the page shows the full conversation history. The last
     // assistant message is the (possibly partial) reply we were waiting on.
     // Use the current assistant count as baseline and only accept a reply that
     // differs from any previously-saved partial.
-    const baselineResult = runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    const baselineResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
     requireSuccess(baselineResult, "opencli browser eval assistant count on resume");
     const baselineCount = Number(baselineResult.stdout.trim());
     if (!Number.isFinite(baselineCount)) {
@@ -965,7 +992,7 @@ function continueCommand(args: string[]): number {
       writeTask(task);
     }
 
-    const outcome = waitForAssistantReply({
+    const outcome = await waitForAssistantReply({
       deadline,
       absoluteCeiling,
       baselineCount,
@@ -1004,7 +1031,7 @@ function continueCommand(args: string[]): number {
   }
 }
 
-function main(): number {
+async function main(): Promise<number> {
   const [command, ...args] = process.argv.slice(2);
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
@@ -1013,15 +1040,15 @@ function main(): number {
   }
 
   if (command === "status") {
-    return statusCommand();
+    return await statusCommand();
   }
 
   if (command === "continue") {
-    return continueCommand(args);
+    return await continueCommand(args);
   }
 
   if (command === "ask") {
-    return askCommand(args);
+    return await askCommand(args);
   }
 
   log(`unknown command: ${command}`);
@@ -1042,4 +1069,4 @@ function installSignalFlush(): void {
 }
 installSignalFlush();
 
-process.exitCode = main();
+main().then((code) => { process.exitCode = code; }).catch((e) => { process.stderr.write(`${(e as Error).stack || e}\n`); process.exitCode = 1; });
