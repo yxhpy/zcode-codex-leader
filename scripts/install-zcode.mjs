@@ -271,8 +271,8 @@ async function verifyInstall() {
       `Installed version mismatch: expected ${version}, got ${installedManifest.version}`,
     );
   }
-  if (installedManifest.hooks !== "./hooks/hooks.json") {
-    throw new Error("Installed ZCode manifest is missing hooks: ./hooks/hooks.json");
+  if (Object.hasOwn(installedManifest, "hooks")) {
+    throw new Error("Installed ZCode manifest must not declare hooks; ZCode auto-discovers hooks/hooks.json and rejects duplicate declarations");
   }
   if (!(await pathExists(path.join(target, "hooks", "hooks.json")))) {
     throw new Error("Installed cache is missing hooks/hooks.json");

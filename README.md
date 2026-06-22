@@ -62,7 +62,7 @@ Pass `--tier` to force, `--task-kind` to infer, or `--model`/`--effort` for full
 
 Requires: `codex` CLI (v0.141.0+) on PATH or at `~/.hermes/node/bin/codex`, and Node.js 22+ (for native `WebSocket` and `--experimental-strip-types`).
 
-This plugin works on **both Codex and ZCode** — they share the same hook format (`SessionStart` / `PreToolUse` / `UserPromptSubmit` / `Stop`) and the same hook execution contract (`additionalContext`, `revisedPrompt`, exit-code-2 blocking). The plugin ships both `.codex-plugin/plugin.json` and `.zcode-plugin/plugin.json` manifests.
+This plugin works on **both Codex and ZCode** — they share the same hook format (`SessionStart` / `PreToolUse` / `UserPromptSubmit` / `Stop`) and the same hook execution contract (`additionalContext`, `revisedPrompt`, exit-code-2 blocking). The plugin ships both `.codex-plugin/plugin.json` and `.zcode-plugin/plugin.json` manifests. ZCode auto-discovers `hooks/hooks.json`; the ZCode manifest intentionally does not declare a `hooks` field to avoid duplicate-hook validation errors.
 
 ### Install on Codex
 

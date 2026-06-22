@@ -42,8 +42,8 @@ if (codexManifest.hooks !== "./hooks/hooks.json") {
   errors.push(".codex-plugin manifest must declare hooks: ./hooks/hooks.json");
 }
 
-if (zcodeManifest.hooks !== "./hooks/hooks.json") {
-  errors.push(".zcode-plugin manifest must declare hooks: ./hooks/hooks.json");
+if (Object.hasOwn(zcodeManifest, "hooks")) {
+  errors.push(".zcode-plugin manifest must not declare hooks; ZCode auto-discovers hooks/hooks.json and treats an explicit duplicate as plugin_hook_invalid");
 }
 
 await expectPathExists(
