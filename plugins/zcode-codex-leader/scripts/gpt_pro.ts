@@ -1591,6 +1591,8 @@ async function workerCommand(args: string[]): Promise<number> {
     log("internal worker requires ask or continue");
     return 2;
   }
+  const initialTask = readTask();
+  if (initialTask && isTerminalTaskStatus(initialTask.status) && initialTask.status !== "completed") return 0;
   patchTask({ status: "starting", pid: process.pid, heartbeatAt: Date.now(), startedAt: Date.now() });
   let code = 2;
   try {
@@ -1612,6 +1614,8 @@ async function fakeWorkerCommand(args: string[]): Promise<number> {
   const [mode, ...rest] = args;
   const delayMs = Number(process.env.GPT_PRO_FAKE_DELAY_MS || "100");
   const out = absolutePathMaybe(optionValue(rest, "--out") || readTask()?.outPath || defaultResultPath(process.env.GPT_PRO_TASK_ID || "fake"))!;
+  const initialTask = readTask();
+  if (initialTask && isTerminalTaskStatus(initialTask.status) && initialTask.status !== "completed") return 0;
   patchTask({ status: "running", command: mode === "continue" ? "continue" : "ask", pid: process.pid, heartbeatAt: Date.now(), outPath: out, resultPath: out });
   await new Promise((resolve) => setTimeout(resolve, Number.isFinite(delayMs) ? delayMs : 100));
   if (isTerminalTaskStatus(readTask()?.status) && readTask()?.status !== "completed") return 0;
@@ -1684,6 +1688,7 @@ async function cancelCommand(args: string[]): Promise<number> {
   if (!isTerminalTaskStatus(task.status)) {
     patchTaskFile(filePath, { status: "cancelled", finishedAt: Date.now(), lastError: "cancelled by user", exitCode: null });
     signalTaskProcess(task.pid, "SIGTERM");
+    patchTaskFile(filePath, { status: "cancelled", finishedAt: Date.now(), lastError: "cancelled by user", exitCode: null });
   }
   const cancelled = readTaskFile(filePath) || task;
   printTaskCompact(cancelled, filePath, false);
