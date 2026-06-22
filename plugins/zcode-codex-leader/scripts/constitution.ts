@@ -119,7 +119,7 @@ Commands:
       Foreground compatibility mode for short/manual Pro calls only. Avoid it for
       deep tasks likely to exceed the Bash tool's 600s ceiling; use start/poll/collect.
   gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
-      Foreground compatibility resume mode. Prefer `gpt-pro start continue --task-id <id>`
+      Foreground compatibility resume mode. Prefer \`gpt-pro start continue --task-id <id>\`
       for long recoveries so the resumed worker is detached.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines

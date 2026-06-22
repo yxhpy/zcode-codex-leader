@@ -271,6 +271,15 @@ async function verifyInstall() {
       `Installed version mismatch: expected ${version}, got ${installedManifest.version}`,
     );
   }
+  if (installedManifest.hooks !== "./hooks/hooks.json") {
+    throw new Error("Installed ZCode manifest is missing hooks: ./hooks/hooks.json");
+  }
+  if (!(await pathExists(path.join(target, "hooks", "hooks.json")))) {
+    throw new Error("Installed cache is missing hooks/hooks.json");
+  }
+  if (!(await pathExists(path.join(target, "hooks", "run-hook")))) {
+    throw new Error("Installed cache is missing hooks/run-hook");
+  }
   if (await pathExists(path.join(target, ".codex-plugin"))) {
     throw new Error("Installed cache still contains .codex-plugin");
   }

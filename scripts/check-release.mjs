@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { access, readFile } from "fs/promises";
+import { spawnSync } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -35,6 +36,52 @@ if (codexManifest.name !== zcodeManifest.name) {
   errors.push(
     `.codex-plugin name ${codexManifest.name} does not match .zcode-plugin name ${zcodeManifest.name}`,
   );
+}
+
+if (codexManifest.hooks !== "./hooks/hooks.json") {
+  errors.push(".codex-plugin manifest must declare hooks: ./hooks/hooks.json");
+}
+
+if (zcodeManifest.hooks !== "./hooks/hooks.json") {
+  errors.push(".zcode-plugin manifest must declare hooks: ./hooks/hooks.json");
+}
+
+await expectPathExists(
+  path.join(repoRoot, "plugins", "zcode-codex-leader", "hooks", "hooks.json"),
+  "hooks/hooks.json does not exist",
+);
+await expectPathExists(
+  path.join(repoRoot, "plugins", "zcode-codex-leader", "hooks", "run-hook"),
+  "hooks/run-hook does not exist",
+);
+
+const hookSmoke = spawnSync(
+  process.execPath,
+  [
+    "--experimental-strip-types",
+    path.join(repoRoot, "plugins", "zcode-codex-leader", "scripts", "leader_hook.ts"),
+    "session-start",
+  ],
+  {
+    input: "{}",
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_ROOT: path.join(repoRoot, "plugins", "zcode-codex-leader"),
+    },
+  },
+);
+if (hookSmoke.status !== 0) {
+  errors.push(`leader_hook.ts session-start smoke test failed: ${hookSmoke.stderr || hookSmoke.stdout}`);
+} else {
+  try {
+    const payload = JSON.parse(hookSmoke.stdout.trim());
+    if (payload?.hookSpecificOutput?.hookEventName !== "SessionStart") {
+      errors.push("leader_hook.ts session-start smoke test returned invalid hookEventName");
+    }
+  } catch {
+    errors.push("leader_hook.ts session-start smoke test did not return JSON");
+  }
 }
 
 const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
