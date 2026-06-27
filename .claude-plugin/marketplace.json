@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "zcode-codex-leader",
+  "description": "Marketplace for the zcode-codex-leader Claude Code plugin.",
+  "owner": {
+    "name": "yxhpy",
+    "url": "https://github.com/yxhpy"
+  },
+  "plugins": [
+    {
+      "name": "zcode-codex-leader",
+      "description": "Leader-only orchestration plugin with hooks, skills, bridge dispatch, GPT-Pro background tasks, and E2E evidence gates.",
+      "source": "./plugins/zcode-codex-leader",
+      "category": "development",
+      "homepage": "https://github.com/yxhpy/zcode-codex-leader"
+    }
+  ]
+}

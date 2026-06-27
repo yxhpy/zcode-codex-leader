@@ -66,8 +66,8 @@ if (Object.hasOwn(zcodeManifest, "hooks")) {
   errors.push(".zcode-plugin manifest must not declare hooks; ZCode auto-discovers hooks/hooks.json and treats an explicit duplicate as plugin_hook_invalid");
 }
 
-if (claudeManifest.hooks !== "./hooks/hooks.json") {
-  errors.push(".claude-plugin manifest must declare hooks: ./hooks/hooks.json");
+if (Object.hasOwn(claudeManifest, "hooks")) {
+  errors.push(".claude-plugin manifest must not declare hooks; Claude Code auto-discovers hooks/hooks.json and treats an explicit duplicate as an error");
 }
 
 if (claudeManifest.skills !== "./skills/") {
