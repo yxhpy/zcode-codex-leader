@@ -44,7 +44,7 @@ node --experimental-strip-types "${PLUGIN_ROOT}/scripts/codex_bridge.ts" <comman
 | `test <prompt> [-- <cmd>] [--browser]` | Model-assisted sandboxed test/repair loop | `codex_bridge.ts test "run pytest" -- pytest -x` |
 | `exec -- <cmd>` | Deterministic local build/test/install/git/cache/deploy command, no LLM tokens | `codex_bridge.ts exec --timeout 600 -- npm test` |
 | `exec --external --approved -- <cmd>` | User-approved external side effect such as deploy/push | `codex_bridge.ts exec --external --approved -- git push` |
-| `gpt-pro start ask <prompt>` | Detached ChatGPT Pro long review/research | `codex_bridge.ts gpt-pro start ask "review this architecture"` |
+| `gpt-pro ask <prompt>` | Detached ChatGPT Pro review/research | `codex_bridge.ts gpt-pro ask "review this architecture"` |
 | `gpt-pro poll/collect/cancel --task-id <id>` | Check/collect/cancel a Pro background task | `codex_bridge.ts gpt-pro collect --task-id abc123` |
 | `mcp-tool <server> <tool> [--args <json>]` | Direct MCP tool call | `codex_bridge.ts mcp-tool filesystem read_file --args '{"path":"x"}'` |
 
@@ -72,7 +72,7 @@ Rule of thumb: if the dispatch is "find/read/summarize" use fast; if it's "write
 1. For normal implementation, write the user request to a temporary request file and dispatch **one** `codex_bridge.ts auto --request-file <file>` call first. This minimizes ZCode main-token usage.
 2. Use lower-level `ask`/`parse`/`web`/`test` packets only when you need explicit routing or a rejected `auto` result needs repair.
 3. Use `exec` for deterministic local commands (build/test/install/git/cache). It uses no LLM tokens and bypasses the worker sandbox. Ask the user first for deploy/push/paid/external side effects, then pass `--external --approved`.
-4. For hard Pro-model review/research, use `gpt-pro start ask`, then `gpt-pro poll` / `gpt-pro collect` (or `gpt-pro cancel`) by `TASK_ID`; do not block a foreground Pro call past the Bash ceiling.
+4. For hard Pro-model review/research, use `gpt-pro ask`, then `gpt-pro poll` / `gpt-pro collect` (or `gpt-pro cancel`) by `TASK_ID`; foreground mode requires explicit `--foreground` and is only for short/manual debugging.
 5. **Ingest & judge** the compact result: *accept* (verified), *reject* (reason), or *mark stale*. Read the `RESULT_FILE` only if the summary is insufficient for verification.
 6. **Verify** the final state yourself with read-only checks (read the produced files, run tests if applicable).
 7. **Report** with a `Plugin evidence:` line per dispatched capability — copy the lines the bridge printed.

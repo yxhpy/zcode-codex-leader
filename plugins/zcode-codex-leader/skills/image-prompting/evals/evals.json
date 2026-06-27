@@ -1,0 +1,38 @@
+{
+  "skill_name": "image-prompting",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Generate a 4:5 campus service-day poster with readable text SERVICE DAY and a warm civic-service feel.",
+      "expected_output": "The agent rewrites the request as a narrative image prompt with subject, setting, style, composition, lighting, palette, and text constraints before dispatching image generation.",
+      "files": [],
+      "expectations": [
+        "The prompt is a coherent scene description rather than a comma-separated keyword list.",
+        "The prompt specifies the 4:5 aspect ratio before generation.",
+        "Readable text is quoted and tied to a physical sign or surface."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Use refs/character.png to make the same character stand in a rainy neon bookstore at night. Keep her face consistent.",
+      "expected_output": "The agent chooses the reference-image/edit path, writes a Master Identity Spec, and changes only the scene/style details needed.",
+      "files": [],
+      "expectations": [
+        "The response defaults to image-to-image/editing because a reference image is provided.",
+        "The prompt includes a stable identity block before the scene description.",
+        "The prompt asks to preserve identity traits while changing scene and atmosphere."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "This generated product image has a bad hand and wrong background. Fix only those issues and keep everything else.",
+      "expected_output": "The agent recommends a targeted edit/inpainting-style follow-up instead of regenerating from scratch.",
+      "files": [],
+      "expectations": [
+        "The response uses a narrow follow-up prompt that changes one main dimension at a time.",
+        "The response explicitly preserves composition, product identity, and unaffected details.",
+        "The response is honest that hands/anatomy may need iterative local repair rather than a guaranteed prompt-only fix."
+      ]
+    }
+  ]
+}

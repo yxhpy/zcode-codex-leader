@@ -103,10 +103,12 @@ Commands:
       ask the user first, then pass --external --approved.
   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
       Dispatch to local Antigravity CLI (agy) for long-context / multimodal / live-web work.
-  gpt-pro start ask <prompt> [--out <file>] [--timeout <sec>]
-      Start a detached ChatGPT Pro background task. Returns TASK_ID, TASK_FILE,
+  gpt-pro ask <prompt> [--out <file>] [--timeout <sec>]
+      Stability-first ChatGPT Pro dispatch. Returns TASK_ID, TASK_FILE,
       RESULT_FILE, POLL_CMD, COLLECT_CMD immediately; the worker continues after
-      the Bash tool returns, so long Pro generations do not hit the 600s ceiling.
+      the Bash tool returns, so Pro generations do not hit the 600s ceiling.
+  gpt-pro start ask <prompt> [--out <file>] [--timeout <sec>]
+      Explicit spelling of the same detached background task protocol.
   gpt-pro poll [--task-id <id>]
       Read task-file status only; never drives the browser and never prints the
       full Pro answer. Use for progress / stale detection.
@@ -115,12 +117,13 @@ Commands:
       With --partial, a timed-out/stale/cancelled task may expose PARTIAL_FILE.
   gpt-pro cancel [--task-id <id>]
       Mark a background task cancelled and SIGTERM its detached worker process group.
-  gpt-pro ask <prompt> [--out <file>] [--timeout <sec>] [--print-full]
-      Foreground compatibility mode for short/manual Pro calls only. Avoid it for
-      deep tasks likely to exceed the Bash tool's 600s ceiling; use start/poll/collect.
-  gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
-      Foreground compatibility resume mode. Prefer \`gpt-pro start continue --task-id <id>\`
-      for long recoveries so the resumed worker is detached.
+  gpt-pro continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]
+      Stability-first resume. Starts a detached continue worker and returns TASK_ID;
+      use poll/collect on that task.
+  gpt-pro ask --foreground <prompt> [--out <file>] [--timeout <sec>] [--print-full]
+  gpt-pro continue --foreground [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
+      Foreground compatibility for short/manual debugging only. Avoid it for
+      deep tasks likely to exceed the Bash tool's 600s ceiling.
 
 Each command prints a trailing "Plugin evidence:" line. You MUST collect those lines
 and reproduce them in your final summary — see Evidence Gate below.
@@ -200,19 +203,19 @@ needed human input.
 
 ## gpt-pro Background Task Loop (MANDATORY)
 
-gpt-pro tasks run on ChatGPT Pro and routinely exceed the Bash tool's 600s ceiling. Long Pro work
-MUST use the detached background protocol, not a blocking foreground ask.
+gpt-pro tasks run on ChatGPT Pro and routinely exceed the Bash tool's 600s ceiling. Pro work
+MUST use the detached background protocol, which is now the default for \`gpt-pro ask\` and \`gpt-pro continue\`.
 
-Hard rule for any hard code review / deep research likely to exceed a few minutes:
+Hard rule for any hard code review / deep research:
 
-1. dispatch \`gpt-pro start ask "<prompt>" --out <file> --timeout <sec>\`
+1. dispatch \`gpt-pro ask "<prompt>" --out <file> --timeout <sec>\` (or explicit \`gpt-pro start ask ...\`)
 2. record \`TASK_ID\`, \`TASK_FILE\`, and \`RESULT_FILE\` from stdout
 3. use \`gpt-pro poll --task-id <TASK_ID>\` for progress; this reads only the task file and returns quickly
 4. if the user cancels or the task is no longer wanted, run \`gpt-pro cancel --task-id <TASK_ID>\`
 5. use \`gpt-pro collect --task-id <TASK_ID>\` until ONE terminal condition:
    - SUCCESS: \`STATUS:completed\` and \`RESULT_FILE:<path>\` exists — read the artifact and continue
    - RECOVERABLE: \`STATUS:timed-out\` or \`STATUS:stale\` with \`CONVERSATION_URL\` — run
-     \`gpt-pro start continue --task-id <TASK_ID> --out <file>\`, then resume polling
+     \`gpt-pro continue --task-id <TASK_ID> --out <file>\` (or explicit \`gpt-pro start continue ...\`), then resume polling
    - PARTIAL: terminal non-success with \`--partial\` exposing \`PARTIAL_FILE\` — use/report partial output
    - FAILURE: explicit ChatGPT/browser error with no recoverable URL or partial artifact
 

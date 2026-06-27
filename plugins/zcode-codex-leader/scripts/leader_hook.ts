@@ -203,11 +203,9 @@ function onUserPromptSubmit(): void {
 
   const reminder = `\n\n[Leader reminder] You are the owner. Do NOT implement, edit files, or run write commands directly — reads and planning are allowed. Decompose the request into bounded packets and dispatch each to the codex app-server worker via codex_bridge.ts (ask / vision / generate-image / mcp-tool). Accept, reject, or mark each result stale after re-checking. Your final summary MUST include a "Plugin evidence:" line per dispatched capability.`;
 
-  // Return a revised prompt (append the reminder). hookSpecificOutput.revisedPrompt
-  // is the binary-confirmed rewrite field for UserPromptSubmit.
   process.stdout.write(JSON.stringify({
     suppressOutput: true,
-    hookSpecificOutput: { hookEventName: "UserPromptSubmit", revisedPrompt: prompt + reminder },
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: reminder },
   }) + "\n");
   process.exit(0);
 }

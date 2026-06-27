@@ -27,8 +27,8 @@ Trusted-op gate routing is a MANDATORY hard rule in constitution.ts (## Trusted 
 
 根治方向见 Pro 报告路线图，季度级工程量。
 
-## gpt-pro 长任务现状（0.8.1）
+## gpt-pro 长任务现状（0.8.11+）
 
-- stale-lock 清理（补丁 #2）：真实有效，bridge 崩溃后自动清锁
-- 外层超时 46min（补丁 #1）：只在**终端直跑**时生效；经 ZCode Bash 仍受 600s ceiling
-- 长任务 >10min 必须**终端直跑**，不经过 ZCode Bash 工具
+- `gpt-pro ask` / `gpt-pro continue` 默认走 detached background task，立即返回 `TASK_ID`，再用 `poll/collect/cancel` 同步
+- stale-lock 清理真实有效：bridge 崩溃后自动清锁，活 task 用 pid/heartbeat 防重复 dispatch
+- `--foreground` 只保留给短任务/手工调试；长 Pro 任务不要前台阻塞，也不需要终端直跑

@@ -1,0 +1,38 @@
+{
+  "skill_name": "codex-leader",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "In this zcode-codex-leader repo, implement a tiny bug fix in a TypeScript source file and verify it. Do not edit directly as the leader; use the plugin workflow.",
+      "expected_output": "The agent routes implementation through codex_bridge.ts, verifies the result with deterministic checks, and reports Plugin evidence.",
+      "files": [],
+      "expectations": [
+        "The response treats the main agent as the owner/leader rather than the implementer.",
+        "Substantive code work is dispatched through codex_bridge.ts instead of direct Edit/Write.",
+        "The final report includes a Plugin evidence line copied from the bridge output."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Explain what plugins/zcode-codex-leader/scripts/leader_hook.ts does, but follow the leader-only rules for source-code understanding.",
+      "expected_output": "The agent uses codex_bridge.ts parse for the source file and summarizes only after reviewing the worker result.",
+      "files": [],
+      "expectations": [
+        "The response does not read or quote the TypeScript source directly as the leader.",
+        "The response uses or proposes codex_bridge.ts parse for source-code understanding.",
+        "The summary distinguishes worker output from leader verification."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run the release check and install command for this plugin, then tell me whether it is ready to use in Codex. Ask before any external push or deploy.",
+      "expected_output": "The agent uses deterministic exec-style commands for local checks/install, avoids external side effects without approval, and reports evidence.",
+      "files": [],
+      "expectations": [
+        "Local deterministic commands are treated differently from model-assisted implementation work.",
+        "The response asks for approval before push/deploy or other external side effects.",
+        "The final status is based on fresh command output rather than assumptions."
+      ]
+    }
+  ]
+}

@@ -18,6 +18,16 @@ function run(pluginData: string, args: string[], extraEnv: Record<string, string
   return { code: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
 }
 
+function runBridge(pluginData: string, args: string[], extraEnv: Record<string, string> = {}): { code: number | null; stdout: string; stderr: string } {
+  const bridgePath = path.join(scriptDir, "codex_bridge.ts");
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", bridgePath, ...args], {
+    cwd: process.cwd(),
+    env: { ...process.env, PLUGIN_DATA: pluginData, ...extraEnv },
+    encoding: "utf8",
+  });
+  return { code: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
+}
+
 function runAsync(pluginData: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, ...args], {
@@ -105,7 +115,7 @@ async function testConcurrentStartSingleton(): Promise<void> {
   assert(/active gpt-pro background task exists|singleton worker lock/.test(failures[0].stderr + failures[0].stdout), `unexpected concurrent failure output\n${failures[0].stdout}\n${failures[0].stderr}`);
 }
 
-function testForegroundAskActiveBackgroundGuard(): void {
+function testDefaultAskActiveBackgroundGuard(): void {
   const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-active-guard-"));
   const tasksDir = path.join(pluginData, "gpt-pro/tasks");
   mkdirSync(tasksDir, { recursive: true });
@@ -137,6 +147,34 @@ function writeLegacyRecoverableTask(pluginData: string): void {
   }, null, 2));
 }
 
+function writeRecoverableV2Task(pluginData: string): void {
+  const tasksDir = path.join(pluginData, "gpt-pro/tasks");
+  mkdirSync(tasksDir, { recursive: true });
+  writeFileSync(path.join(tasksDir, "recoverable-v2.json"), JSON.stringify({
+    schemaVersion: 2,
+    taskId: "recoverable-v2",
+    status: "timed-out",
+    conversationUrl: "https://chatgpt.com/c/recoverable-v2",
+    conversationId: "recoverable-v2",
+    prompt: "old v2 prompt",
+    sentAt: Date.now(),
+    createdAt: Date.now(),
+    resultPath: path.join(pluginData, "recoverable-v2-result.txt"),
+    partialText: "partial v2",
+  }, null, 2));
+}
+
+function testDefaultAskRecoverableV2Guard(): void {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-v2-guard-"));
+  writeRecoverableV2Task(pluginData);
+  const ask = run(pluginData, ["ask", "do not duplicate v2 recoverable", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+  });
+  assert(ask.code === 2, `recoverable v2 default ask should be refused\nstdout=${ask.stdout}\nstderr=${ask.stderr}`);
+  assert(ask.stderr.includes("recoverable gpt-pro task exists"), `recoverable v2 guard message missing\n${ask.stderr}`);
+  assert(field(ask.stdout, "TASK_ID") === "recoverable-v2", `recoverable v2 guard should print existing task fields\n${ask.stdout}`);
+}
+
 function testStartAskRecoverableLegacyGuard(): void {
   const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-start-legacy-"));
   writeLegacyRecoverableTask(pluginData);
@@ -148,7 +186,7 @@ function testStartAskRecoverableLegacyGuard(): void {
   assert(field(start.stdout, "CONVERSATION_URL") === "https://chatgpt.com/c/recoverable", `start guard should print legacy task fields\n${start.stdout}`);
 }
 
-function testForegroundAskRecoverableGuard(): void {
+function testDefaultAskRecoverableGuard(): void {
   const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-guard-"));
   writeLegacyRecoverableTask(pluginData);
 
@@ -179,13 +217,131 @@ function testStaleDetection(): void {
   assert(saved.status === "stale", "poll did not persist stale status");
 }
 
+async function testDefaultAskStartsBackgroundTask(): Promise<void> {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-default-ask-"));
+  const ask = run(pluginData, ["ask", "hello from default background ask", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+    GPT_PRO_FAKE_DELAY_MS: "120",
+  });
+  assert(ask.code === 0, `default ask should start a background task\nstdout=${ask.stdout}\nstderr=${ask.stderr}`);
+  const taskId = field(ask.stdout, "TASK_ID");
+  const taskFile = field(ask.stdout, "TASK_FILE");
+  const resultFile = field(ask.stdout, "RESULT_FILE");
+  assert(taskId, "default ask did not print TASK_ID");
+  assert(taskFile && existsSync(taskFile), "default ask did not create TASK_FILE");
+  assert(resultFile, "default ask did not print RESULT_FILE");
+
+  await sleep(350);
+  const collect = run(pluginData, ["collect", "--task-id", taskId]);
+  assert(collect.code === 0, `collect default ask failed\nstdout=${collect.stdout}\nstderr=${collect.stderr}`);
+  assert(field(collect.stdout, "STATUS") === "completed", `default ask task did not complete\n${collect.stdout}`);
+  assert(existsSync(resultFile), "default ask result file missing");
+}
+
+async function testDefaultAskPersistsModel(): Promise<void> {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-model-"));
+  const ask = run(pluginData, ["ask", "hello from model ask", "--model", "Pro 扩展", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+    GPT_PRO_FAKE_DELAY_MS: "120",
+  });
+  assert(ask.code === 0, `default ask with model should start a background task\nstdout=${ask.stdout}\nstderr=${ask.stderr}`);
+  const taskFile = field(ask.stdout, "TASK_FILE");
+  assert(field(ask.stdout, "MODEL") === "Pro 扩展", `default ask should print MODEL\n${ask.stdout}`);
+  const saved = JSON.parse(readFileSync(taskFile, "utf8"));
+  assert(saved.model === "Pro 扩展", `default ask should persist model\n${readFileSync(taskFile, "utf8")}`);
+}
+
+function testBackgroundAskDoesNotPersistTotalTimeout(): void {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-no-timeout-"));
+  const ask = run(pluginData, ["ask", "hello from no timeout ask", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+  });
+  assert(ask.code === 0, `background ask should start without a total timeout\nstdout=${ask.stdout}\nstderr=${ask.stderr}`);
+  const taskFile = field(ask.stdout, "TASK_FILE");
+  const saved = JSON.parse(readFileSync(taskFile, "utf8"));
+  assert(saved.timeoutSec === undefined, `background ask should not persist timeoutSec\n${readFileSync(taskFile, "utf8")}`);
+  assert(saved.deadlineAt === undefined, `background ask should not persist deadlineAt\n${readFileSync(taskFile, "utf8")}`);
+  assert(saved.absoluteCeilingAt === undefined, `background ask should not persist absoluteCeilingAt\n${readFileSync(taskFile, "utf8")}`);
+}
+
+async function testBridgeAskForwardsModel(): Promise<void> {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-bridge-model-"));
+  const ask = runBridge(pluginData, ["gpt-pro", "ask", "hello from bridge model ask", "--model", "Pro 扩展", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+    GPT_PRO_FAKE_DELAY_MS: "120",
+  });
+  assert(ask.code === 0, `bridge ask --model should start a background task\nstdout=${ask.stdout}\nstderr=${ask.stderr}`);
+  const taskFile = field(ask.stdout, "TASK_FILE");
+  assert(field(ask.stdout, "MODEL") === "Pro 扩展", `bridge ask should print MODEL\n${ask.stdout}`);
+  const saved = JSON.parse(readFileSync(taskFile, "utf8"));
+  assert(saved.model === "Pro 扩展", `bridge ask should persist model\n${readFileSync(taskFile, "utf8")}`);
+}
+
+async function testDefaultContinueStartsBackgroundTask(): Promise<void> {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-default-continue-"));
+  const resume = run(pluginData, ["continue", "--url", "https://chatgpt.com/c/stability-test", "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+    GPT_PRO_FAKE_DELAY_MS: "120",
+  });
+  assert(resume.code === 0, `default continue should start a background task\nstdout=${resume.stdout}\nstderr=${resume.stderr}`);
+  const taskId = field(resume.stdout, "TASK_ID");
+  const taskFile = field(resume.stdout, "TASK_FILE");
+  const resultFile = field(resume.stdout, "RESULT_FILE");
+  assert(taskId, "default continue did not print TASK_ID");
+  assert(taskFile && existsSync(taskFile), "default continue did not create TASK_FILE");
+  assert(resultFile, "default continue did not print RESULT_FILE");
+
+  await sleep(350);
+  const collect = run(pluginData, ["collect", "--task-id", taskId]);
+  assert(collect.code === 0, `collect default continue failed\nstdout=${collect.stdout}\nstderr=${collect.stderr}`);
+  assert(field(collect.stdout, "STATUS") === "completed", `default continue task did not complete\n${collect.stdout}`);
+  assert(existsSync(resultFile), "default continue result file missing");
+}
+
+async function testBridgeContinueForwardsTaskId(): Promise<void> {
+  const pluginData = mkdtempSync(path.join(os.tmpdir(), "gpt-pro-bg-bridge-continue-"));
+  const taskId = "resume-task";
+  const tasksDir = path.join(pluginData, "gpt-pro/tasks");
+  const resultFile = path.join(pluginData, "resume-result.txt");
+  mkdirSync(tasksDir, { recursive: true });
+  writeFileSync(path.join(tasksDir, `${taskId}.json`), JSON.stringify({
+    schemaVersion: 2,
+    taskId,
+    status: "timed-out",
+    conversationUrl: "https://chatgpt.com/c/resume-task",
+    resultPath: resultFile,
+    outPath: resultFile,
+    createdAt: Date.now(),
+  }, null, 2));
+
+  const resume = runBridge(pluginData, ["gpt-pro", "continue", "--task-id", taskId, "--timeout", "5"], {
+    GPT_PRO_TEST_FAKE_WORKER: "1",
+    GPT_PRO_FAKE_DELAY_MS: "120",
+  });
+  assert(resume.code === 0, `bridge continue --task-id should start a background task\nstdout=${resume.stdout}\nstderr=${resume.stderr}`);
+  assert(field(resume.stdout, "TASK_ID") === taskId, `bridge continue did not preserve task id\n${resume.stdout}`);
+
+  await sleep(350);
+  const collect = run(pluginData, ["collect", "--task-id", taskId]);
+  assert(collect.code === 0, `collect bridge continue failed\nstdout=${collect.stdout}\nstderr=${collect.stderr}`);
+  assert(field(collect.stdout, "STATUS") === "completed", `bridge continue task did not complete\n${collect.stdout}`);
+  assert(existsSync(resultFile), "bridge continue result file missing");
+}
+
 async function main(): Promise<void> {
   await testStartPollCollect();
+  await testDefaultAskStartsBackgroundTask();
+  await testDefaultAskPersistsModel();
+  testBackgroundAskDoesNotPersistTotalTimeout();
+  await testDefaultContinueStartsBackgroundTask();
+  await testBridgeAskForwardsModel();
+  await testBridgeContinueForwardsTaskId();
   await testCancelBackgroundTask();
   await testConcurrentStartSingleton();
-  testForegroundAskActiveBackgroundGuard();
+  testDefaultAskActiveBackgroundGuard();
+  testDefaultAskRecoverableV2Guard();
   testStartAskRecoverableLegacyGuard();
-  testForegroundAskRecoverableGuard();
+  testDefaultAskRecoverableGuard();
   testStaleDetection();
   process.stdout.write("gpt_pro_background_test: PASS\n");
 }

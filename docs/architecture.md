@@ -58,7 +58,7 @@ WebSocket frames are **whole JSON-RPC messages** (not newline-delimited like std
 |-------|--------------------|-----------------|------------------|
 | `SessionStart` | `cwd`, `source`, `session_id` | — | `hookSpecificOutput.additionalContext` |
 | `PreToolUse` | `tool_name`, `tool_input` | exit 2 + stderr reason | — |
-| `UserPromptSubmit` | `prompt` | exit 2 + stderr | `hookSpecificOutput.revisedPrompt` |
+| `UserPromptSubmit` | `prompt` | exit 2 + stderr | `hookSpecificOutput.additionalContext` |
 | `Stop` | `last_assistant_message` | exit 2 + stderr | — |
 
 Exit codes: `0` = success/allow; `2` = block (stderr must carry the reason); other non-zero = error. `suppressOutput:true` keeps hook stdout out of the user's view.
@@ -73,7 +73,7 @@ Environment: `${PLUGIN_ROOT}` (and `${CLAUDE_PLUGIN_ROOT}` alias) is the install
 
 **Soft enforcement** (prompt-level, reinforces the hard layer):
 - SessionStart injects the leader constitution into context.
-- UserPromptSubmit appends a leader reminder to each prompt.
+- UserPromptSubmit injects a leader reminder into context.
 
 ## Session state
 
@@ -81,9 +81,9 @@ Environment: `${PLUGIN_ROOT}` (and `${CLAUDE_PLUGIN_ROOT}` alias) is the install
 
 ## GPT-Pro background tasks (0.8.7+)
 
-`gpt-pro start ask/continue` creates a detached worker process with its own task file under `PLUGIN_DATA/gpt-pro/tasks/<task-id>.json`, result artifact under `PLUGIN_DATA/gpt-pro/results/<task-id>.txt`, and log under `PLUGIN_DATA/gpt-pro/logs/<task-id>.log`. The start call returns immediately with `TASK_ID`, `TASK_FILE`, `RESULT_FILE`, `POLL_CMD`, `COLLECT_CMD`, and `CANCEL_CMD`; later foreground `poll`/`collect`/`cancel` calls read or update the durable task file. This is the explicit exception to same-turn synchronous waiting, added because ChatGPT Pro generations can exceed the ZCode Bash 600s ceiling.
+`gpt-pro ask/continue` are stability-first aliases for the detached worker protocol. They create a task file under `PLUGIN_DATA/gpt-pro/tasks/<task-id>.json`, result artifact under `PLUGIN_DATA/gpt-pro/results/<task-id>.txt`, and log under `PLUGIN_DATA/gpt-pro/logs/<task-id>.log`, then return immediately with `TASK_ID`, `TASK_FILE`, `RESULT_FILE`, `POLL_CMD`, `COLLECT_CMD`, and `CANCEL_CMD`. Later foreground `poll`/`collect`/`cancel` calls read or update the durable task file. This is the explicit exception to same-turn synchronous waiting, added because ChatGPT Pro generations can exceed the ZCode Bash 600s ceiling.
 
-Legacy foreground `gpt-pro ask/continue` still exists for short/manual use, but long Pro work should use start/poll/collect.
+Legacy foreground mode still exists as explicit `gpt-pro ask --foreground` / `gpt-pro continue --foreground` for short/manual debugging only.
 
 ## Model tier routing (0.5.0)
 
@@ -117,6 +117,13 @@ The PreToolUse Bash gate was too strict (blocked `codex --version`, `readlink`, 
 - **Expanded allowlist**: read-only inspection commands (version queries for node/python/go/rustc/swift/make/docker/codex, readlink, file, test, uname, git config --get, npm ls/view, etc.) are allowed directly.
 - **Dangerous-op blacklist**: a backstop regex catches write/destructive ops (rm -rf, git commit/push/merge, npm install, curl -X POST, chmod, sudo, kill -9, etc.) even if they start with an allowlisted word. Checked BEFORE the allowlist.
 - Order: bridge path -> dangerous blacklist -> readonly allowlist -> block.
+
+## Platform manifests and E2E notes
+
+- Codex uses `.codex-plugin/plugin.json`; ZCode uses `.zcode-plugin/plugin.json`; Claude Code uses `.claude-plugin/plugin.json`.
+- Claude Code can load this repo session-locally with `claude --plugin-dir plugins/zcode-codex-leader`; the manifest validates with `claude plugin validate`.
+- Browser-enabled `test --browser` must pass Codex plugin overrides as TOML inline tables, not JSON strings: `plugins={"browser@openai-bundled"={enabled=true},"chrome@openai-bundled"={enabled=true}}`.
+- Nested Codex CLI E2E that starts another `codex app-server` requires outer `codex exec -s danger-full-access`; `workspace-write` blocks the inner app-server during state/runtime initialization with `Operation not permitted`.
 
 ## Failure modes
 

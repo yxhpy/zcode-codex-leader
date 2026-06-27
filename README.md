@@ -62,7 +62,7 @@ Pass `--tier` to force, `--task-kind` to infer, or `--model`/`--effort` for full
 
 Requires: `codex` CLI (v0.141.0+) on PATH or at `~/.hermes/node/bin/codex`, and Node.js 22+ (for native `WebSocket` and `--experimental-strip-types`).
 
-This plugin works on **both Codex and ZCode** — they share the same hook format (`SessionStart` / `PreToolUse` / `UserPromptSubmit` / `Stop`) and the same hook execution contract (`additionalContext`, `revisedPrompt`, exit-code-2 blocking). The plugin ships both `.codex-plugin/plugin.json` and `.zcode-plugin/plugin.json` manifests. ZCode auto-discovers `hooks/hooks.json`; the ZCode manifest intentionally does not declare a `hooks` field to avoid duplicate-hook validation errors.
+This plugin works on **Codex, ZCode, and Claude Code** — they share the same hook format (`SessionStart` / `PreToolUse` / `UserPromptSubmit` / `Stop`) and the same hook execution contract (`additionalContext`, exit-code-2 blocking). The plugin ships `.codex-plugin/plugin.json`, `.zcode-plugin/plugin.json`, and `.claude-plugin/plugin.json` manifests. ZCode auto-discovers `hooks/hooks.json`; the ZCode manifest intentionally does not declare a `hooks` field to avoid duplicate-hook validation errors.
 
 ### Install on Codex
 
@@ -85,6 +85,24 @@ node scripts/install-zcode.mjs
 ```
 
 Restart ZCode (or start a new session) so the hooks take effect.
+
+### Install on Claude Code
+
+Use a session-local plugin directory for smoke testing without changing global Claude Code state:
+
+```bash
+printf '%s' '只回答：claude-plugin-smoke' \
+  | claude -p --verbose \
+      --plugin-dir plugins/zcode-codex-leader \
+      --include-hook-events \
+      --output-format stream-json
+```
+
+Persistent marketplace installation should use Claude Code's `claude plugin` commands after validating the manifest:
+
+```bash
+claude plugin validate plugins/zcode-codex-leader
+```
 
 ### Upgrading
 
@@ -130,6 +148,19 @@ After install, the next Codex/ZCode session automatically:
 
 > Note: ZCode loads plugins at app startup. If ZCode is already running, restart it (or start a new session) so the newly enabled plugin's hooks take effect.
 
+## 0.8.12 E2E closure
+
+The release was verified with the full local/remote capability loop:
+
+| Surface | Evidence |
+|---------|----------|
+| Local regressions | `gpt_pro_background_test: PASS`; `chaos_test`: 22 passed, 0 failed; `check-release`: metadata OK |
+| Bridge basics | `parse`, `ask`, `exec`, and `test` all returned `Plugin evidence:` lines |
+| Rich bridge tools | `vision`, `generate-image`, `web`, `mcp-tool node_repl/js`, and browser-enabled `test --browser` returned `Plugin evidence:` lines |
+| GPT-Pro | Real `gpt_pro_real_e2e_test.ts` completed with marker and `TASK_ID` |
+| Codex CLI | `codex exec -s danger-full-access` loaded hooks and completed `codex_bridge.ts parse`; `workspace-write` is not enough for nested `codex app-server` |
+| Claude Code | `.claude-plugin/plugin.json` validates; session-local `--plugin-dir` smoke emits hook events |
+
 ## How the leader works
 
 Once installed, ZCode operates in a strict dispatch loop:
@@ -142,7 +173,7 @@ Once installed, ZCode operates in a strict dispatch loop:
    node --experimental-strip-types "$PLUGIN_ROOT/scripts/codex_bridge.ts" ask "write a Python merge sort"
    ```
 3. **Use deterministic `exec` for commands** like build/test/install/git/cache when no model reasoning is needed; use `--external --approved` only after user approval for deploy/push/paid/external side effects.
-4. **Use GPT-Pro background tasks for long Pro work**: `gpt-pro start ask ...` returns `TASK_ID`/`TASK_FILE`/`RESULT_FILE`, then `gpt-pro poll` / `gpt-pro collect` / `gpt-pro cancel` synchronize without blocking on the Bash 600s ceiling.
+4. **Use GPT-Pro's stability-first background flow**: `gpt-pro ask ...` / `gpt-pro continue ...` now return `TASK_ID`/`TASK_FILE`/`RESULT_FILE` immediately; use `gpt-pro poll` / `gpt-pro collect` / `gpt-pro cancel` to synchronize without blocking on the Bash 600s ceiling.
 5. **Ingest & judge** each compact result — accept, reject, or mark stale. Read the `RESULT_FILE` artifact only when needed for verification.
 6. **Verify** the final state with read-only checks.
 7. **Report** with a `Plugin evidence:` line per dispatched capability (copied from the bridge output).

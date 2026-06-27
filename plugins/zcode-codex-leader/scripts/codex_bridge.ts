@@ -29,13 +29,13 @@
 //   agy <prompt> [--model <m>] [--timeout <dur>] [--add-dir <dir>]
 //       Dispatch a task to the local Antigravity CLI (agy) — long-context,
 //       multimodal, live web.
-//   gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
-//   gpt-pro start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]
+//   gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>]
+//   gpt-pro start continue [--task-id <id> | --url <url>] [--out <file>]
 //   gpt-pro poll [--task-id <id> | --task-file <file>]
 //   gpt-pro collect [--task-id <id> | --task-file <file>] [--partial]
 //   gpt-pro cancel [--task-id <id> | --task-file <file>]
-//   gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
-//   gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>]
+//   gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>]
+//   gpt-pro continue [--task-id <id> | --url <url>] [--out <file>]
 //   gpt-pro status
 //   gpt-pro help
 //       Dispatch to ChatGPT web Pro via opencli Browser Bridge.
@@ -453,10 +453,13 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     args.push("help");
   } else if (command === "continue") {
     args.push("continue");
+    if (flags.foreground) args.push("--foreground");
+    const taskId = flags["task-id"];
+    if (taskId) args.push("--task-id", taskId);
     const url = flags.url;
     if (url) args.push("--url", url);
     if (flags.timeout) args.push("--timeout", flags.timeout);
-    const outPath = flags.out || (shouldPrintFull(flags) ? undefined : compactArtifactPath("gpt-pro-result", {}, "txt"));
+    const outPath = flags.out || (flags.foreground && !shouldPrintFull(flags) ? compactArtifactPath("gpt-pro-result", {}, "txt") : undefined);
     if (outPath) args.push("--out", outPath);
   } else if (command === "ask") {
     const prompt = positional[1];
@@ -473,8 +476,10 @@ async function cmdGptPro(positional: string[], flags: Record<string, string>): P
     for (const filePath of filePaths) args.push("--file", filePath);
     const outPath = flags.out || (shouldPrintFull(flags) ? undefined : compactArtifactPath("gpt-pro-result", {}, "txt"));
     if (outPath) args.push("--out", outPath);
+    if (flags.model) args.push("--model", flags.model);
     if (flags.timeout) args.push("--timeout", flags.timeout);
     if (flags.force) args.push("--force");
+    if (flags.foreground) args.push("--foreground");
   } else {
     fail("gpt-pro requires start, poll, collect, cancel, status, ask, continue, or help");
   }
@@ -1018,16 +1023,19 @@ Usage:
       Resume an interrupted run.
   codex_bridge resume --run <run_id>
       Alias for 'run --run'.
-  codex_bridge gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]
-  codex_bridge gpt-pro start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]
+  codex_bridge gpt-pro start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>]
+  codex_bridge gpt-pro start continue [--task-id <id> | --url <url>] [--out <file>]
       Start a detached GPT-Pro background task; stdout returns TASK_ID/TASK_FILE/RESULT_FILE/POLL_CMD/COLLECT_CMD/CANCEL_CMD.
   codex_bridge gpt-pro poll [--task-id <id> | --task-file <file>]
   codex_bridge gpt-pro collect [--task-id <id> | --task-file <file>] [--partial]
   codex_bridge gpt-pro cancel [--task-id <id> | --task-file <file>]
       Poll/collect/cancel background GPT-Pro task files without driving the browser; stdout stays compact.
-  codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>] [--print-full]
-  codex_bridge gpt-pro continue [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
-      Foreground compatibility mode: resume a timed-out gpt-pro conversation by reopening its saved /c/<id> URL. If --out is omitted, bridge creates one so stdout stays small.
+  codex_bridge gpt-pro ask [<prompt> | --prompt-file <file>] [--model <name>] [--file <path> ...] [--out <file>] [--print-full]
+  codex_bridge gpt-pro continue [--task-id <id> | --url <url>] [--out <file>] [--print-full]
+      Stability-first aliases for start ask/start continue: return TASK_ID immediately, then use poll/collect/cancel.
+  codex_bridge gpt-pro ask --foreground [<prompt> | --prompt-file <file>] [--model <name>] [--file <path> ...] [--out <file>] [--timeout <sec>] [--print-full]
+  codex_bridge gpt-pro continue --foreground [--url <url>] [--timeout <sec>] [--out <file>] [--print-full]
+      Foreground compatibility for short/manual debugging only; long Pro work can hit the caller's 600s ceiling.
   codex_bridge gpt-pro status
   codex_bridge gpt-pro help
       Dispatch to ChatGPT web Pro via opencli Browser Bridge.

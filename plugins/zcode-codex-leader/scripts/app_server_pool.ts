@@ -313,7 +313,6 @@ function workerArgs(imageGeneration: boolean): string[] {
     "-c", "sandbox_mode=\"workspace-write\"",
     "-c", "features.plugins=false",
     "-c", "mcp_servers={}",
-    "-c", "mcp_servers.node_repl.enabled=false",
     "-c", "features.apps=false",
     "-c", "features.browser_use=false",
     "-c", "features.browser_use_external=false",
@@ -1007,7 +1006,7 @@ export async function runTestTurn(
         "-c", "features.browser_use=true",
         "-c", "features.browser_use_external=true",
         "-c", "features.plugins=true",
-        "-c", 'plugins={"browser@openai-bundled":{"enabled":true},"chrome@openai-bundled":{"enabled":true}}',
+        "-c", 'plugins={"browser@openai-bundled"={enabled=true},"chrome@openai-bundled"={enabled=true}}',
       );
     }
 

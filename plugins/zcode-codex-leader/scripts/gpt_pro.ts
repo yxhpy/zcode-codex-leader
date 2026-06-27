@@ -23,6 +23,7 @@ type GptProTask = {
   conversationId?: string;
   prompt?: string;
   promptFile?: string;
+  model?: string;
   files?: string[];
   baselineCount?: number;
   sentAt?: number;
@@ -49,6 +50,7 @@ type GptProTask = {
 
 type AskArgs = {
   prompt: string;
+  model?: string;
   files: string[];
   out?: string;
   timeoutSec: number;
@@ -226,19 +228,21 @@ function usage(): string {
     "Usage:",
     "  gpt_pro.ts help",
     "  gpt_pro.ts status",
-    "  gpt_pro.ts start ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
-    "  gpt_pro.ts start continue [--task-id <id> | --url <url>] [--timeout <sec>] [--out <file>]",
+    "  gpt_pro.ts start ask [<prompt> | --prompt-file <file>] [--model <name>] [--file <path> ...] [--out <file>]",
+    "  gpt_pro.ts start continue [--task-id <id> | --url <url>] [--out <file>]",
     "  gpt_pro.ts poll [--task-id <id> | --task-file <file>]",
     "  gpt_pro.ts collect [--task-id <id> | --task-file <file>] [--partial]",
     "  gpt_pro.ts cancel [--task-id <id> | --task-file <file>]",
     "      Background mode: start returns TASK_ID/TASK_FILE/RESULT_FILE immediately;",
     "      poll/collect/cancel read or update task files and keep stdout compact.",
-    "  gpt_pro.ts ask [<prompt> | --prompt-file <file>] [--file <path> ...] [--out <file>] [--timeout <sec>]",
-    "  gpt_pro.ts continue [--url <url>] [--timeout <sec>] [--out <file>]",
-    "      Foreground compatibility mode. Resume a timed-out gpt-pro conversation: reopen its saved /c/<id> URL and",
-    "      wait for the SAME reply instead of re-dispatching the prompt. ask refuses",
-    "      to re-dispatch while an unfinished task (generating/timed-out, within 2h)",
-    "      is on record; pass --force to ask to discard it.",
+    "  gpt_pro.ts ask [<prompt> | --prompt-file <file>] [--model <name>] [--file <path> ...] [--out <file>] [--force]",
+    "  gpt_pro.ts continue [--task-id <id> | --url <url>] [--out <file>]",
+    "      Stability-first default: ask/continue are aliases for start ask/start continue,",
+    "      so long Pro work runs detached and is synchronized with poll/collect.",
+    "  gpt_pro.ts ask --foreground ...",
+    "  gpt_pro.ts continue --foreground ...",
+    "      Foreground compatibility mode for short/manual debugging only. It can still hit",
+    "      the caller's 600s ceiling; prefer default background mode for reliability.",
     "",
     "Environment:",
     "  OPENCLI_BIN  Path to opencli binary. Defaults to PATH lookup, then /opt/homebrew/bin/opencli.",
@@ -363,6 +367,10 @@ async function runOpencliWithinDeadline(args: string[], deadline: number): Promi
   return await runOpencli(args, Math.min(opencliTimeoutMs(args), remainingMs));
 }
 
+async function runOpencliBounded(args: string[]): Promise<RunResult> {
+  return await runOpencli(args, opencliTimeoutMs(args));
+}
+
 function outputOf(result: RunResult): string {
   return `${result.stdout}\n${result.stderr}`;
 }
@@ -459,6 +467,7 @@ async function statusCommand(): Promise<number> {
 function parseAskArgs(args: string[]): AskArgs {
   let prompt: string | undefined;
   let promptFile: string | undefined;
+  let model: string | undefined;
   const files: string[] = [];
   let out: string | undefined;
   let force = false;
@@ -498,6 +507,16 @@ function parseAskArgs(args: string[]): AskArgs {
         throw new Error("missing value for --out");
       }
       out = value;
+      i += 1;
+      continue;
+    }
+
+    if (arg === "--model") {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error("missing value for --model");
+      }
+      model = value;
       i += 1;
       continue;
     }
@@ -543,7 +562,7 @@ function parseAskArgs(args: string[]): AskArgs {
     throw new Error("missing prompt or file");
   }
 
-  return { prompt: prompt || "", files, out, timeoutSec, force, url };
+  return { prompt: prompt || "", model, files, out, timeoutSec, force, url };
 }
 
 function requireSuccess(result: RunResult, label: string): void {
@@ -612,16 +631,13 @@ function writeAssistantOutput(text: string, out?: string): void {
 }
 
 async function waitForAssistantReply(params: {
-  deadline: number;
-  absoluteCeiling: number;
   baselineCount: number;
   sentAt: number;
   prevPartial?: string;
   out?: string;
 }): Promise<WaitOutcome> {
-  let deadline = params.deadline;
   const resumeMode = Object.prototype.hasOwnProperty.call(params, "prevPartial");
-  const generationStartDeadline = Math.min(deadline, params.sentAt + 30000);
+  const generationProbeUntil = params.sentAt + 30000;
   let sawGenerating = false;
   let lastText = "";
   let currentText = "";
@@ -635,104 +651,62 @@ async function waitForAssistantReply(params: {
       snapshot.count > params.baselineCount || (resumeMode && snapshot.count >= params.baselineCount)
         ? snapshot.text
         : "";
-    // ponytail: flush incrementally on content growth — page jitter can momentarily shorten currentText, so only write when it genuinely grew past the last flush. This is what makes a SIGTERM/timeout kill recoverable: the most recent grown snapshot is already on disk.
     if (currentText && currentText !== lastFlushedText && currentText.length > lastFlushedText.length) {
       flushPartial(currentText, params.out);
       lastFlushedText = currentText;
     }
   };
   const acceptable = (text: string): boolean => {
-    if (!text) {
-      return false;
-    }
+    if (!text) return false;
     return params.prevPartial === undefined || text !== params.prevPartial;
   };
-  const currentDeadline = (): number => (Date.now() < deadline ? deadline : params.absoluteCeiling);
 
-  while (Date.now() < generationStartDeadline) {
+  while (Date.now() < generationProbeUntil) {
     touchTaskHeartbeat("running");
-    const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], deadline);
+    const generating = await runOpencliBounded(["browser", "eval", IS_GENERATING_JS]);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
       sawGenerating = true;
       break;
     }
-    if (commandFailed(generating)) {
-      log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
-    }
+    if (commandFailed(generating)) log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
 
-    const snapshot = await readAssistantSnapshot(deadline);
-    if (snapshot) {
-      updateSnapshot(snapshot);
-    }
-
-    if (Date.now() < generationStartDeadline) {
-      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-      if (commandFailed(waited)) {
-        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-      }
-    }
+    const snapshot = await readAssistantSnapshot();
+    if (snapshot) updateSnapshot(snapshot);
+    const waited = await runOpencliBounded(["browser", "wait", "time", "2"]);
+    if (commandFailed(waited)) log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
   }
 
-  while (Date.now() < params.absoluteCeiling) {
+  for (;;) {
     touchTaskHeartbeat("running");
-    const operationDeadline = currentDeadline();
-    const generating = await runOpencliWithinDeadline(["browser", "eval", IS_GENERATING_JS], operationDeadline);
+    const generating = await runOpencliBounded(["browser", "eval", IS_GENERATING_JS]);
     if (!commandFailed(generating) && generating.stdout.trim() === "true") {
       sawGenerating = true;
-      if (Date.now() >= deadline && Date.now() < params.absoluteCeiling) {
-        deadline = Math.min(params.absoluteCeiling, deadline + 120000);
-        log(`extending deadline (still generating): +120s, new total budget ${Math.round((deadline - params.sentAt) / 1000)}s`);
-      }
-      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-      if (commandFailed(waited)) {
-        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-      }
+      const waited = await runOpencliBounded(["browser", "wait", "time", "2"]);
+      if (commandFailed(waited)) log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
       continue;
     }
-    if (commandFailed(generating)) {
-      log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
-    }
+    if (commandFailed(generating)) log(`opencli browser eval failed: ${generating.error?.message || generating.stderr || generating.status}`);
 
-    const snapshot = await readAssistantSnapshot(operationDeadline);
-    if (snapshot) {
-      updateSnapshot(snapshot);
-    }
+    const snapshot = await readAssistantSnapshot();
+    if (snapshot) updateSnapshot(snapshot);
 
     if (sawGenerating) {
       if (acceptable(currentText)) {
         writeAssistantOutput(currentText, params.out);
-        return { status: "completed", text: currentText, lastText, finalDeadline: deadline };
+        return { status: "completed", text: currentText, lastText, finalDeadline: 0 };
       }
     } else if (currentText) {
       stableReads = currentText === lastText ? stableReads + 1 : 1;
       lastText = currentText;
       if (stableReads >= 3 && Date.now() - params.sentAt >= 20000 && acceptable(currentText)) {
         writeAssistantOutput(currentText, params.out);
-        return { status: "completed", text: currentText, lastText, finalDeadline: deadline };
+        return { status: "completed", text: currentText, lastText, finalDeadline: 0 };
       }
     }
 
-    if (Date.now() < deadline) {
-      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline);
-      if (commandFailed(waited)) {
-        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-      }
-    } else if (Date.now() < params.absoluteCeiling) {
-      // Past the initial deadline but within the auto-extend window: avoid a
-      // tight spin while waiting for the next generating/stable check.
-      const waited = await runOpencliWithinDeadline(["browser", "wait", "time", "2"], params.absoluteCeiling);
-      if (commandFailed(waited)) {
-        log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
-      }
-    }
+    const waited = await runOpencliBounded(["browser", "wait", "time", "2"]);
+    if (commandFailed(waited)) log(`opencli browser wait failed: ${waited.error?.message || waited.stderr || waited.status}`);
   }
-
-  return {
-    status: "timed-out",
-    text: currentText || lastText || "",
-    lastText,
-    finalDeadline: deadline,
-  };
 }
 
 function mimeTypeForPath(filePath: string): string {
@@ -927,6 +901,76 @@ async function getComposerIndex(deadline?: number): Promise<string | null> {
   return findComposerIndex(outputOf(second));
 }
 
+async function readSelectedModel(deadline: number): Promise<string> {
+  const js = `(() => {
+    const form = document.querySelector("form");
+    const root = form || document;
+    const button = [...root.querySelectorAll("button")].find((el) => el.getAttribute("aria-haspopup") === "menu" && (el.innerText || el.textContent || "").trim());
+    if (!button) return JSON.stringify({ ok: false, error: "model button not found" });
+    return JSON.stringify({ ok: true, model: (button.innerText || button.textContent || "").trim() });
+  })()`;
+  const result = await runOpencliWithinDeadline(["browser", "eval", js], deadline);
+  requireSuccess(result, "opencli browser eval selected model");
+  let payload: { ok?: boolean; model?: string; error?: string };
+  try {
+    payload = JSON.parse(result.stdout.trim());
+  } catch {
+    throw new Error(`selected model returned invalid JSON\n${result.stdout.trim() || result.stderr.trim()}`);
+  }
+  if (!payload.ok || !payload.model) throw new Error(`selected model failed${payload.error ? `: ${payload.error}` : ""}`);
+  return payload.model;
+}
+
+async function selectModel(model: string, deadline: number): Promise<void> {
+  const requested = model.trim();
+  if (!requested) throw new Error("--model must be a non-empty string");
+  if (await readSelectedModel(deadline) === requested) return;
+
+  const focusJs = `(() => {
+    const form = document.querySelector("form");
+    const root = form || document;
+    const button = [...root.querySelectorAll("button")].find((el) => el.getAttribute("aria-haspopup") === "menu" && (el.innerText || el.textContent || "").trim());
+    if (!button) return JSON.stringify({ ok: false, error: "model button not found" });
+    button.focus();
+    return JSON.stringify({ ok: document.activeElement === button, model: (button.innerText || button.textContent || "").trim() });
+  })()`;
+  const focused = await runOpencliWithinDeadline(["browser", "eval", focusJs], deadline);
+  requireSuccess(focused, "opencli browser eval focus model button");
+  let focusPayload: { ok?: boolean; error?: string };
+  try {
+    focusPayload = JSON.parse(focused.stdout.trim());
+  } catch {
+    throw new Error(`focus model button returned invalid JSON\n${focused.stdout.trim() || focused.stderr.trim()}`);
+  }
+  if (!focusPayload.ok) throw new Error(`focus model button failed${focusPayload.error ? `: ${focusPayload.error}` : ""}`);
+
+  requireSuccess(await runOpencliWithinDeadline(["browser", "keys", "Enter"], deadline), "opencli browser keys Enter model menu");
+  requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait model menu");
+
+  const selectJs = `(() => {
+    const requested = ${JSON.stringify(requested)};
+    const items = [...document.querySelectorAll("[role=menuitemradio]")];
+    const options = items.map((el) => (el.innerText || el.textContent || "").trim()).filter(Boolean);
+    const item = items.find((el) => (el.innerText || el.textContent || "").trim() === requested);
+    if (!item) return JSON.stringify({ ok: false, error: "model option not found", options });
+    item.click();
+    return JSON.stringify({ ok: true, options });
+  })()`;
+  const selected = await runOpencliWithinDeadline(["browser", "eval", selectJs], deadline);
+  requireSuccess(selected, "opencli browser eval select model");
+  let selectPayload: { ok?: boolean; error?: string; options?: string[] };
+  try {
+    selectPayload = JSON.parse(selected.stdout.trim());
+  } catch {
+    throw new Error(`select model returned invalid JSON\n${selected.stdout.trim() || selected.stderr.trim()}`);
+  }
+  if (!selectPayload.ok) throw new Error(`select model failed${selectPayload.error ? `: ${selectPayload.error}` : ""}: ${(selectPayload.options || []).join(", ")}`);
+
+  requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait selected model");
+  const actual = await readSelectedModel(deadline);
+  if (actual !== requested) throw new Error(`selected model mismatch: expected ${requested}, got ${actual}`);
+}
+
 async function askCommand(args: string[]): Promise<number> {
   let parsed: AskArgs;
   try {
@@ -969,7 +1013,7 @@ async function askCommand(args: string[]): Promise<number> {
   } else if (!sameBackgroundTask && existingRecoverable && existingAgeMs < TWO_HOURS_MS && !parsed.force) {
     const ageMin = Math.round(existingAgeMs / 60000);
     log(`unfinished gpt-pro task found (status=${existing?.status}, started ${ageMin}m ago, url=${existing?.conversationUrl || "pending"}).`);
-    log(existing?.taskId ? `Resume it with: gpt-pro start continue --task-id ${existing.taskId} [--timeout <sec>] [--out <file>]` : `Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
+    log(existing?.taskId ? `Resume it with: gpt-pro continue --task-id ${existing.taskId} [--timeout <sec>] [--out <file>]` : `Resume it with: gpt-pro continue [--timeout <sec>] [--out <file>]`);
     log(`Or pass --force to ask to discard it and start a new conversation.`);
     log(`Do NOT re-run ask for the same prompt — that opens a new conversation and wastes the already-spent generation time.`);
     return 2;
@@ -979,22 +1023,19 @@ async function askCommand(args: string[]): Promise<number> {
     clearTask();
   }
 
-  let deadline = Date.now() + parsed.timeoutSec * 1000;
-  const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
+  const operationDeadline = Number.MAX_SAFE_INTEGER;
   if (isBackgroundWorker()) {
     patchTask({
       status: "starting",
       pid: process.pid,
       heartbeatAt: Date.now(),
       startedAt: Date.now(),
-      timeoutSec: parsed.timeoutSec,
-      deadlineAt: deadline,
-      absoluteCeilingAt: absoluteCeiling,
+      model: parsed.model,
       outPath: absolutePathMaybe(parsed.out),
     });
   }
   try {
-    const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
+    const doctor = await runOpencliWithinDeadline(["doctor"], operationDeadline);
     if (!isBridgeConnected(doctor)) {
       log("opencli Bridge is not connected.");
       if (doctor.error) {
@@ -1006,34 +1047,41 @@ async function askCommand(args: string[]): Promise<number> {
       return 2;
     }
 
-    requireSuccess(await runOpencliWithinDeadline(["browser", "open", CHATGPT_URL], deadline), "opencli browser open");
-    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "open", CHATGPT_URL], operationDeadline), "opencli browser open");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], operationDeadline), "opencli browser wait");
 
-    const composerIndex = await getComposerIndex(deadline);
+    let composerIndex = await getComposerIndex(operationDeadline);
     if (!composerIndex) {
       throw new Error("could not find ChatGPT composer element id=prompt-textarea role=textbox");
     }
+    if (parsed.model) {
+      await selectModel(parsed.model, operationDeadline);
+      composerIndex = await getComposerIndex(operationDeadline);
+      if (!composerIndex) {
+        throw new Error("could not find ChatGPT composer element id=prompt-textarea role=textbox after model selection");
+      }
+    }
 
-    await clearComposer(deadline);
-    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], deadline), "opencli browser wait after clear composer");
+    await clearComposer(operationDeadline);
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "1"], operationDeadline), "opencli browser wait after clear composer");
 
     if (parsed.files.length > 0) {
-      await uploadFiles(parsed.files, deadline);
+      await uploadFiles(parsed.files, operationDeadline);
     }
 
     const prompt = parsed.prompt || (parsed.files.length > 0 ? "请审查上传的文件。" : "");
     if (prompt) {
-      requireSuccess(await runOpencliWithinDeadline(["browser", "type", composerIndex, prompt], deadline), "opencli browser type");
+      requireSuccess(await runOpencliWithinDeadline(["browser", "type", composerIndex, prompt], operationDeadline), "opencli browser type");
     }
 
-    const baselineCountResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    const baselineCountResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], operationDeadline);
     requireSuccess(baselineCountResult, "opencli browser eval assistant baseline count");
     const baselineCount = Number(baselineCountResult.stdout.trim());
     if (!Number.isFinite(baselineCount)) {
       throw new Error(`assistant baseline count returned invalid value\n${baselineCountResult.stdout.trim() || baselineCountResult.stderr.trim()}`);
     }
 
-    await sendPrompt(deadline);
+    await sendPrompt(operationDeadline);
 
     // Persist the conversation URL as soon as ChatGPT assigns one, so a later
     // `gpt-pro continue` can reopen this exact conversation if we time out or get
@@ -1041,8 +1089,8 @@ async function askCommand(args: string[]): Promise<number> {
     let conversationUrl = "";
     let conversationId = "";
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      requireBeforeDeadline(deadline, "extract conversation url");
-      const urlResult = await runOpencliWithinDeadline(["browser", "eval", EXTRACT_CONVERSATION_URL_JS], deadline);
+      requireBeforeDeadline(operationDeadline, "extract conversation url");
+      const urlResult = await runOpencliWithinDeadline(["browser", "eval", EXTRACT_CONVERSATION_URL_JS], operationDeadline);
       if (!commandFailed(urlResult)) {
         try {
           const payload = JSON.parse(urlResult.stdout.trim()) as { url?: string; pathname?: string };
@@ -1057,8 +1105,8 @@ async function askCommand(args: string[]): Promise<number> {
         }
       }
       if (attempt < 7) {
-        requireBeforeDeadline(deadline, "wait for conversation url");
-        requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], deadline), "opencli browser wait for conversation url");
+        requireBeforeDeadline(operationDeadline, "wait for conversation url");
+        requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "2"], operationDeadline), "opencli browser wait for conversation url");
       }
     }
     if (conversationUrl) {
@@ -1071,6 +1119,7 @@ async function askCommand(args: string[]): Promise<number> {
         conversationUrl,
         conversationId,
         prompt: parsed.prompt,
+        model: parsed.model || previousTask?.model,
         files: parsed.files,
         baselineCount,
         sentAt: Date.now(),
@@ -1078,7 +1127,6 @@ async function askCommand(args: string[]): Promise<number> {
         heartbeatAt: Date.now(),
         pid: process.pid,
         status: "running",
-        timeoutSec: parsed.timeoutSec,
         outPath: absolutePathMaybe(parsed.out) || previousTask?.outPath,
         resultPath: absolutePathMaybe(parsed.out) || previousTask?.resultPath,
       });
@@ -1088,8 +1136,6 @@ async function askCommand(args: string[]): Promise<number> {
 
     const sentAt = Date.now();
     const outcome = await waitForAssistantReply({
-      deadline,
-      absoluteCeiling,
       baselineCount,
       sentAt,
       out: parsed.out,
@@ -1112,11 +1158,12 @@ async function askCommand(args: string[]): Promise<number> {
     }
     const task = readTask();
     if (task) {
-      task.status = "timed-out";
+      task.status = "failed";
       task.partialText = outcome.text || "";
       task.partialPath = absolutePathMaybe(parsed.out) || task.partialPath;
       task.finishedAt = Date.now();
       task.exitCode = outcome.text ? 0 : 2;
+      task.lastError = "assistant response ended without completion";
       writeTask(task);
       if (task.conversationUrl) {
         log(`gpt-pro: timed out. Conversation preserved at ${task.conversationUrl}.`);
@@ -1132,7 +1179,6 @@ async function askCommand(args: string[]): Promise<number> {
 
 async function continueCommand(args: string[]): Promise<number> {
   let url: string | undefined;
-  let timeoutSec = 900;
   let out: string | undefined;
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -1151,8 +1197,7 @@ async function continueCommand(args: string[]): Promise<number> {
         log(usage());
         return 2;
       }
-      timeoutSec = Number(v);
-      if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+      if (!Number.isFinite(Number(v)) || Number(v) <= 0) {
         log("--timeout must be a positive number of seconds");
         return 2;
       }
@@ -1184,22 +1229,21 @@ async function continueCommand(args: string[]): Promise<number> {
     return 2;
   }
 
-  let deadline = Date.now() + timeoutSec * 1000;
-  const absoluteCeiling = deadline + MAX_AUTO_EXTEND_MS;
+  const operationDeadline = Number.MAX_SAFE_INTEGER;
   if (isBackgroundWorker()) {
     patchTask({
       status: "starting",
       pid: process.pid,
       heartbeatAt: Date.now(),
       startedAt: Date.now(),
-      timeoutSec,
-      deadlineAt: deadline,
-      absoluteCeilingAt: absoluteCeiling,
+      timeoutSec: undefined,
+      deadlineAt: undefined,
+      absoluteCeilingAt: undefined,
       outPath: absolutePathMaybe(out),
     });
   }
   try {
-    const doctor = await runOpencliWithinDeadline(["doctor"], deadline);
+    const doctor = await runOpencliWithinDeadline(["doctor"], operationDeadline);
     if (!isBridgeConnected(doctor)) {
       log("opencli Bridge is not connected.");
       if (doctor.error) log(doctor.error.message);
@@ -1207,14 +1251,10 @@ async function continueCommand(args: string[]): Promise<number> {
       return 2;
     }
 
-    requireSuccess(await runOpencliWithinDeadline(["browser", "open", conversationUrl], deadline), "opencli browser open conversation");
-    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], deadline), "opencli browser wait");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "open", conversationUrl], operationDeadline), "opencli browser open conversation");
+    requireSuccess(await runOpencliWithinDeadline(["browser", "wait", "time", "5"], operationDeadline), "opencli browser wait");
 
-    // After reload, the page shows the full conversation history. The last
-    // assistant message is the (possibly partial) reply we were waiting on.
-    // Use the current assistant count as baseline and only accept a reply that
-    // differs from any previously-saved partial.
-    const baselineResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], deadline);
+    const baselineResult = await runOpencliWithinDeadline(["browser", "eval", ASSISTANT_COUNT_JS], operationDeadline);
     requireSuccess(baselineResult, "opencli browser eval assistant count on resume");
     const baselineCount = Number(baselineResult.stdout.trim());
     if (!Number.isFinite(baselineCount)) {
@@ -1229,14 +1269,14 @@ async function continueCommand(args: string[]): Promise<number> {
       task.baselineCount = baselineCount;
       task.pid = process.pid;
       task.heartbeatAt = Date.now();
-      task.timeoutSec = timeoutSec;
+      task.timeoutSec = undefined;
+      task.deadlineAt = undefined;
+      task.absoluteCeilingAt = undefined;
       task.outPath = absolutePathMaybe(out) || task.outPath;
       writeTask(task);
     }
 
     const outcome = await waitForAssistantReply({
-      deadline,
-      absoluteCeiling,
       baselineCount,
       sentAt,
       prevPartial,
@@ -1248,28 +1288,23 @@ async function continueCommand(args: string[]): Promise<number> {
         t.status = "completed";
         t.finishedAt = Date.now();
         t.exitCode = 0;
+        t.timeoutSec = undefined;
+        t.deadlineAt = undefined;
+        t.absoluteCeilingAt = undefined;
         writeTask(t);
         if (!isBackgroundWorker()) clearTask();
       }
       return 0;
     }
-    log("timed out waiting for assistant response to stabilize on resume.");
-    if (outcome.text) {
-      log("timed out but saving partial assistant response");
-      // writeAssistantOutput already called by the helper when it had accepted
-      // a reply; on timed-out we still print any partial we have.
-      writeAssistantOutput(outcome.text, out);
-    }
     const t = readTask();
     if (t) {
-      t.status = "timed-out";
+      t.status = "failed";
       t.partialText = outcome.text || "";
       t.partialPath = absolutePathMaybe(out) || t.partialPath;
       t.finishedAt = Date.now();
       t.exitCode = outcome.text ? 0 : 2;
+      t.lastError = "assistant response ended without completion";
       writeTask(t);
-      log(`gpt-pro: timed out on resume. Conversation preserved at ${t.conversationUrl}.`);
-      log(`Resume again with: gpt-pro continue (via codex_bridge). Do NOT re-run ask.`);
     }
     return outcome.text ? 0 : 2;
   } catch (error) {
@@ -1416,6 +1451,18 @@ function findActiveTask(): { filePath: string; task: GptProTask } | null {
   return null;
 }
 
+function findRecoverableTask(): { filePath: string; task: GptProTask } | null {
+  const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+  for (const filePath of allTaskFiles()) {
+    const task = readTaskFile(filePath);
+    if (!task?.conversationUrl) continue;
+    if (task.status !== "timed-out" && task.status !== "stale") continue;
+    const ageMs = Date.now() - (task.finishedAt || task.sentAt || task.createdAt || Date.now());
+    if (ageMs < TWO_HOURS_MS) return { filePath, task };
+  }
+  return null;
+}
+
 function printTaskCompact(task: GptProTask, filePath: string, includeSummary = true): void {
   const heartbeatAge = task.heartbeatAt ? Math.max(0, Math.round((Date.now() - task.heartbeatAt) / 1000)) : undefined;
   printLine("TASK_ID", task.taskId);
@@ -1425,6 +1472,7 @@ function printTaskCompact(task: GptProTask, filePath: string, includeSummary = t
   printLine("PARTIAL_FILE", task.partialPath);
   printLine("LOG_FILE", task.logPath);
   printLine("CONVERSATION_URL", task.conversationUrl);
+  printLine("MODEL", task.model);
   printLine("PID", task.pid);
   printLine("HEARTBEAT_AGE_SEC", heartbeatAge);
   if (includeSummary) printLine("SUMMARY", task.summary || (task.partialText ? summarizeTaskText(task.partialText) : undefined));
@@ -1486,6 +1534,19 @@ async function startCommand(args: string[]): Promise<number> {
       patchTaskFile(active.filePath, { status: "stale", finishedAt: Date.now(), lastError: "superseded by start --force" });
     }
 
+    const recoverableTask = mode === "ask" ? findRecoverableTask() : null;
+    if (recoverableTask && !force) {
+      log(`recoverable gpt-pro task exists: ${recoverableTask.task.conversationUrl}`);
+      printTaskCompact(recoverableTask.task, recoverableTask.filePath);
+      log(`Resume it with: gpt-pro continue --task-id ${recoverableTask.task.taskId || "<id>"} [--timeout <sec>] [--out <file>]`);
+      log(`Or pass --force to discard it and start a new conversation.`);
+      log(`Do NOT re-run ask for the same prompt — that opens a new conversation and wastes the already-spent generation time.`);
+      return 2;
+    }
+    if (recoverableTask && force) {
+      patchTaskFile(recoverableTask.filePath, { status: "stale", finishedAt: Date.now(), lastError: "superseded by start ask --force" });
+    }
+
     const legacyTask = mode === "ask" ? readTaskFile(legacyTaskPath()) : null;
     const legacyAgeMs = legacyTask ? Date.now() - (legacyTask.sentAt || legacyTask.createdAt || Date.now()) : 0;
     const legacyRecoverable = Boolean(
@@ -1498,8 +1559,9 @@ async function startCommand(args: string[]): Promise<number> {
     if (legacyRecoverable && !force) {
       log(`recoverable legacy gpt-pro task exists: ${legacyTask!.conversationUrl}`);
       printTaskCompact(legacyTask!, legacyTaskPath());
-      log(`Resume it with: gpt-pro start continue --url ${legacyTask!.conversationUrl} [--timeout <sec>] [--out <file>]`);
+      log(`Resume it with: gpt-pro continue --url ${legacyTask!.conversationUrl} [--timeout <sec>] [--out <file>]`);
       log(`Or pass --force to discard it and start a new conversation.`);
+      log(`Do NOT re-run ask for the same prompt — that opens a new conversation and wastes the already-spent generation time.`);
       return 2;
     }
     if (legacyRecoverable && force) {
@@ -1513,6 +1575,7 @@ async function startCommand(args: string[]): Promise<number> {
     let timeoutSec = 900;
     let prompt = "";
     let promptFile: string | undefined;
+    let model: string | undefined;
     let files: string[] = [];
     let conversationUrl: string | undefined;
     let existingTask: GptProTask | null = null;
@@ -1522,6 +1585,7 @@ async function startCommand(args: string[]): Promise<number> {
       timeoutSec = parsed.timeoutSec;
       prompt = parsed.prompt;
       promptFile = optionValue(rest, "--prompt-file");
+      model = parsed.model;
       files = parsed.files;
       if (!outPath) outPath = defaultResultPath(taskId);
       workerArgs = ensureOption(workerArgs, "--out", outPath);
@@ -1556,11 +1620,12 @@ async function startCommand(args: string[]): Promise<number> {
       updatedAt: now,
       startedAt: now,
       heartbeatAt: now,
-      timeoutSec,
-      deadlineAt: now + timeoutSec * 1000,
-      absoluteCeilingAt: now + timeoutSec * 1000 + MAX_AUTO_EXTEND_MS,
+      timeoutSec: undefined,
+      deadlineAt: undefined,
+      absoluteCeilingAt: undefined,
       prompt,
       promptFile,
+      model: model || existingTask?.model,
       files,
       conversationUrl: conversationUrl || existingTask?.conversationUrl,
       outPath: absolutePathMaybe(outPath),
@@ -1732,11 +1797,17 @@ async function main(): Promise<number> {
   }
 
   if (command === "continue") {
-    return await continueCommand(args);
+    if (hasOption(args, "--foreground")) {
+      return await continueCommand(withoutOptions(args, new Set(["--foreground"])));
+    }
+    return await startCommand(["continue", ...args]);
   }
 
   if (command === "ask") {
-    return await askCommand(args);
+    if (hasOption(args, "--foreground")) {
+      return await askCommand(withoutOptions(args, new Set(["--foreground"])));
+    }
+    return await startCommand(["ask", ...args]);
   }
 
   log(`unknown command: ${command}`);

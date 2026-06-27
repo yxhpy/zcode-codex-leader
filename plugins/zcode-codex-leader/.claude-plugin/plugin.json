@@ -1,0 +1,13 @@
+{
+  "name": "zcode-codex-leader",
+  "version": "0.8.12",
+  "description": "Force Claude Code into leader-only mode. Hard PreToolUse gate blocks direct edits, commands, source-code Read, and WebSearch/WebFetch; all code generation, code understanding, visual understanding, web research, image generation, and MCP tool work is dispatched through codex_bridge.ts. SessionStart injects the leader constitution and Stop enforces Plugin evidence.",
+  "author": {
+    "name": "zcode-codex-leader contributors"
+  },
+  "homepage": "https://github.com/yxhpy/zcode-codex-leader",
+  "repository": "https://github.com/yxhpy/zcode-codex-leader",
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

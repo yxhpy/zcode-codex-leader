@@ -1,0 +1,38 @@
+{
+  "skill_name": "frontend-delivery",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "The dashboard page looks generic and cramped on mobile. Update the UI through the leader workflow and prove the rendered page matches the design direction.",
+      "expected_output": "The agent dispatches frontend implementation, captures or requests a runtime screenshot, compares visual output, and iterates on concrete differences.",
+      "files": [],
+      "expectations": [
+        "The plan includes a visual feedback loop rather than code-only completion.",
+        "The implementation packet asks the worker to reuse existing UI components or design tokens first.",
+        "The final report separates implemented changes from visual verification evidence."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Build a settings panel component with loading, empty, error, disabled, hover, active, and focus-visible states. Keep it consistent with the existing design system.",
+      "expected_output": "The agent scopes the work to reusable component patterns and requires state coverage plus accessibility-visible interactions.",
+      "files": [],
+      "expectations": [
+        "The worker packet includes loading, empty, error, disabled, hover, active, and focus-visible states.",
+        "The response prioritizes existing components/design tokens over new libraries or arbitrary values.",
+        "The agent verifies the component in the running UI or states why that runtime surface is blocked."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I attached a reference screenshot for a landing page hero. Make the local page match it closely without adding a new UI library.",
+      "expected_output": "The agent routes reference-image understanding to vision/worker flow, dispatches implementation, screenshots the result, and compares against the reference.",
+      "files": [],
+      "expectations": [
+        "The response uses the visual understanding path for the reference screenshot rather than direct image ingestion by the leader.",
+        "The implementation avoids installing a new UI library unless the user explicitly approves it.",
+        "The final verification includes screenshot comparison or a clear blocker."
+      ]
+    }
+  ]
+}
