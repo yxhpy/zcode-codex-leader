@@ -166,6 +166,15 @@ type SessionState = {
   restartedAt: number;
   threadId?: string;
   dispatchCount: number;
+  // True for one-shot workers (image / test) spawned with their own process and
+  // NOT persisted to session.json. runTurnOnState's resident-epoch-staleness
+  // guard must be skipped for transient workers, because it compares the
+  // worker's turnEpoch against the on-disk resident workerEpoch — which for a
+  // freshly-spawned transient worker is always 1, while the resident session's
+  // epoch climbs across restarts, so the guard would always fire and kill every
+  // transient turn. See issue: generate-image always fails with
+  // "worker epoch advanced" once the resident worker has restarted.
+  transient?: boolean;
 };
 
 let residentChild: ChildProcess | undefined;
@@ -366,6 +375,10 @@ async function spawnWorker(imageGeneration: boolean, persist: boolean): Promise<
     restartCount: 0,
     restartedAt: Date.now(),
     dispatchCount: 0,
+    // spawnWorker(false, false) is the image-worker path (called by runImageTurn
+    // via spawnWorker(true, false)); it is NOT the resident worker, so mark it
+    // transient so the epoch-staleness guard is skipped for it.
+    transient: !persist,
   };
   if (persist) writeSession(state);
   return { state, child };
@@ -859,11 +872,20 @@ async function runTurnOnState(
 
       client.onNotification((m) => {
         const now = Date.now();
-        const currentEpoch = readSession()?.workerEpoch ?? turnEpoch;
-        if (currentEpoch > turnEpoch) {
-          residentThreadStale = true;
-          finish("workerEpochChanged");
-          return;
+        // The epoch-staleness guard detects a resident-worker restart by
+        // comparing this turn's epoch against the on-disk resident epoch.
+        // It is meaningless — and actively harmful — for transient workers
+        // (image / test), which own their own process and never share the
+        // resident session.json epoch. For them turnEpoch (1) would always be
+        // less than the resident epoch (climbs across restarts), so the guard
+        // would fire on every notification and abort every transient turn.
+        if (!state.transient) {
+          const currentEpoch = readSession()?.workerEpoch ?? turnEpoch;
+          if (currentEpoch > turnEpoch) {
+            residentThreadStale = true;
+            finish("workerEpochChanged");
+            return;
+          }
         }
         lastNotificationAt = now;
         if (m.method === "item/completed") {
@@ -1049,6 +1071,9 @@ export async function runTestTurn(
     restartCount: 0,
     restartedAt: Date.now(),
     dispatchCount: 0,
+    // One-shot test worker is NOT the resident worker; skip the resident-epoch
+    // staleness guard (see SessionState.transient).
+    transient: true,
   };
 
   try {
