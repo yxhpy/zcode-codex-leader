@@ -181,8 +181,15 @@ let residentChild: ChildProcess | undefined;
 let residentThreadStale = false;
 
 const NOTIFICATION_POLL_TIMEOUT_MS = 250;
-const POST_TOOL_QUIET_TIMEOUT_MS = 90000;
-const DEFAULT_TURN_CEILING_MS = 300000;
+// Watchdog: interrupt the turn if the worker goes fully silent (no WS
+// notification of any kind) for this long after starting. Pre-0.8.15 this was
+// armed only on tool-item completion, which falsely killed workers that were
+// actively emitting assistant text/reasoning after a tool call (e.g. writing a
+// long plan/document). Now armed on EVERY notification — see armPostToolQuiet in
+// runTurnOnState. Tunable via env for emergency debugging.
+const POST_TOOL_QUIET_TIMEOUT_MS = Number(process.env.ZCODE_POST_TOOL_QUIET_MS) || 90000;
+// Hard ceiling: a wedged turn can never outlive this. Tunable via env.
+const DEFAULT_TURN_CEILING_MS = Number(process.env.ZCODE_TURN_CEILING_MS) || 300000;
 const AUTH_FAILURE_HINT = "Codex authentication failed — your ChatGPT/Codex login looks expired or invalid. Run `codex login` to refresh, then retry.";
 
 // Raised when the resident worker is wedged (turn/start timed out). runTurn
@@ -832,9 +839,14 @@ async function runTurnOnState(
       client.ws.addEventListener("error", () => { workerDied = true; finish("workerDied"); });
 
       // Notification stream: collect items, mark done on turn/completed, and
-      // arm a postToolQuiet timer that fires if the worker goes silent for 90s
-      // after finishing a tool (a common hang where the turn loop stalls but the
-      // WS stays open). The timer is reset on every tool completion.
+      // arm a silence watchdog that fires if the worker goes fully quiet (no WS
+      // notification of any kind) for postToolQuietMs. This catches the common
+      // hang where the turn loop stalls but the WS stays open. The timer is
+      // reset on EVERY notification (tool call, assistant text, reasoning,
+      // heartbeat) — a worker that is still emitting anything is still alive and
+      // must not be interrupted. (Pre-0.8.15 this only reset on tool-item
+      // completion, which falsely killed workers generating long text after a
+      // tool call.)
       let postToolTimer: ReturnType<typeof setTimeout> | null = null;
       const armPostToolQuiet = () => {
         if (postToolQuietMs <= 0) return;
@@ -888,6 +900,13 @@ async function runTurnOnState(
           }
         }
         lastNotificationAt = now;
+        // Reset the silence watchdog on EVERY notification. Any worker activity
+        // (tool call, assistant text, reasoning, heartbeat) means the turn is
+        // progressing and must not be interrupted. The watchdog only fires when
+        // the worker goes truly silent for postToolQuietMs. (Pre-0.8.15 this
+        // reset only happened on tool-item completion inside collectItem, which
+        // falsely killed workers emitting long assistant text after a tool.)
+        armPostToolQuiet();
         if (m.method === "item/completed") {
           collectItem(m.params?.item || {});
         } else if (m.method === "turn/completed") {
@@ -946,8 +965,12 @@ async function runTurnOnState(
     if (breakReason && !done) {
       const elapsedMs = Date.now() - startedAt;
       const quietMs = Date.now() - lastNotificationAt;
+      const note =
+        breakReason === "postToolQuiet"
+          ? ` (worker went fully silent for ${Math.round(quietMs / 1000)}s with no notifications — treated as hung)`
+          : "";
       process.stderr.write(
-        `[worker-hang] reason=${breakReason} elapsed=${Math.round(elapsedMs / 1000)}s lastNotification=${Math.round(quietMs / 1000)}s ago done=${done} turnId=${turnId}\n`,
+        `[worker-hang] reason=${breakReason} elapsed=${Math.round(elapsedMs / 1000)}s lastNotification=${Math.round(quietMs / 1000)}s ago done=${done} turnId=${turnId}${note}\n`,
       );
     }
 
